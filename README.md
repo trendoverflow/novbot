@@ -13,7 +13,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 | Component | Role |
 |-----------|------|
-| `novbot-center` | MySQL-backed config authority; gRPC `Control.Connect` bidi stream; HTTP admin API |
+| `novbot-center` | MySQL-backed config authority; gRPC `Control.Session` bidi stream; HTTP admin API |
 | `novbot-node` | Long-running daemon; pull-on-boot config into memory; scheduled / dispatched probes; report + retry spool; single-file egress |
 | `novbot-core` | Shared JSON specs, probes, schedules, retry spool |
 | `novbot-proto` | `novbot.v1.Control` protobuf |
@@ -98,7 +98,7 @@ On success the node writes `./data/demo-1/last_result.json` (single-file OSS egr
 
 ### gRPC
 
-`Control.Connect` bi-directional stream: Register, Heartbeat, PullConfig, ReportResult, Ack; server may PushConfig / Dispatch / PushSchedule.
+`Control.Session` bi-directional stream: Register, Heartbeat, PullConfig, ReportResult, Ack; server may PushConfig / Dispatch / PushSchedule.
 
 ## Repositories
 
