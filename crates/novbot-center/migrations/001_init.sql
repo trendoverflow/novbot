@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   node_id VARCHAR(128) PRIMARY KEY,
   hostname VARCHAR(255) NOT NULL DEFAULT '',
   version VARCHAR(64) NOT NULL DEFAULT '',
-  labels_json JSON NOT NULL,
+  labels_json LONGTEXT NOT NULL,
   last_seen_at DATETIME(3) NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
@@ -11,8 +11,8 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE TABLE IF NOT EXISTS node_configs (
   node_id VARCHAR(128) PRIMARY KEY,
   config_generation BIGINT NOT NULL DEFAULT 1,
-  specs_json JSON NOT NULL,
-  schedules_json JSON NOT NULL,
+  specs_json LONGTEXT NOT NULL,
+  schedules_json LONGTEXT NOT NULL,
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   CONSTRAINT fk_node_configs_node FOREIGN KEY (node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS results (
   run_id VARCHAR(64) NOT NULL,
   spec_id VARCHAR(128) NOT NULL,
   status VARCHAR(32) NOT NULL,
-  payload_json JSON NOT NULL,
+  payload_json LONGTEXT NOT NULL,
   observed_at DATETIME(3) NOT NULL,
   received_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   INDEX idx_results_node_time (node_id, received_at),

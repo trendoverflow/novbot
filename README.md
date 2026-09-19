@@ -31,13 +31,15 @@ Apache-2.0. See [LICENSE](LICENSE).
 ### 1. MySQL
 
 ```bash
-# Optional local MySQL
+# Optional local MySQL (image mysql:8.4; caching_sha2 is default — do not pass
+# --default-authentication-plugin, which is invalid on 8.4)
 docker compose up -d
 
 export NOVBOT_DATABASE_URL='mysql://novbot:novbot@127.0.0.1:3306/novbot'
 ```
 
 Center applies migrations under `crates/novbot-center/migrations/` on startup.
+JSON-shaped fields are stored as `LONGTEXT` so sqlx can decode them as `String` on MySQL 8.4.
 
 ### 2. Build
 
