@@ -1226,6 +1226,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "novbot-core",
  "novbot-proto",
  "serde",
  "serde_json",

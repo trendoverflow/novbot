@@ -13,7 +13,7 @@ use novbot_core::{
 };
 use novbot_proto::control_client::ControlClient;
 use novbot_proto::{
-    client_message, server_message, ClientMessage, HeartbeatRequest, PullConfigRequest,
+    client_message, server_message, ClientMessage, Dispatch, HeartbeatRequest, PullConfigRequest,
     RegisterRequest, ReportResultRequest, ServerMessage,
 };
 use serde_json::json;
@@ -271,15 +271,7 @@ async fn on_server(
             tracing::info!(generation = push.config_generation, "schedules pushed");
         }
         server_message::Body::Dispatch(d) => {
-            run_due(
-                node_id,
-                state,
-                spool,
-                data_dir,
-                tx,
-                Some(d.spec_id.as_str()),
-            )
-            .await?;
+            run_dispatch(node_id, state, spool, data_dir, tx, &d).await?;
         }
         server_message::Body::ReportResult(_)
         | server_message::Body::Ack(_)
@@ -383,6 +375,86 @@ async fn run_due(
                 })
                 .await?;
         }
+    }
+    Ok(())
+}
+
+async fn run_dispatch(
+    node_id: &str,
+    state: &Arc<RwLock<RuntimeState>>,
+    spool: &Arc<RetrySpool>,
+    data_dir: &PathBuf,
+    tx: &mpsc::Sender<ClientMessage>,
+    d: &Dispatch,
+) -> Result<()> {
+    let mut spec = {
+        let st = state.read().await;
+        st.specs
+            .get(&d.spec_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("dispatch unknown spec_id: {}", d.spec_id))?
+    };
+    if !d.params_json.trim().is_empty() {
+        if let Ok(overlay) = serde_json::from_str::<serde_json::Value>(&d.params_json) {
+            if let Some(obj) = overlay.as_object() {
+                if !spec.params.is_object() {
+                    spec.params = json!({});
+                }
+                let base = spec.params.as_object_mut().unwrap();
+                for (k, v) in obj {
+                    base.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+
+    let run_id = if d.run_id.is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        d.run_id.clone()
+    };
+    let observed_at = Utc::now().timestamp_millis();
+    let (status, payload) = match run_probe(&spec).await {
+        Ok(out) => (out.status.to_string(), out.payload),
+        Err(e) => ("error".to_string(), json!({"error": e.to_string()})),
+    };
+    let payload_json = serde_json::to_string(&payload)?;
+    let egress = json!({
+        "node_id": node_id,
+        "run_id": run_id,
+        "spec_id": spec.id,
+        "status": status,
+        "payload": payload,
+        "observed_at_unix_ms": observed_at,
+        "source": "dispatch",
+    });
+    if let Err(e) = write_egress_result(data_dir, &egress).await {
+        tracing::warn!(error = %e, "egress write failed");
+    }
+
+    let msg = ClientMessage {
+        request_id: Uuid::new_v4().to_string(),
+        body: Some(client_message::Body::ReportResult(ReportResultRequest {
+            node_id: node_id.to_string(),
+            run_id: run_id.clone(),
+            spec_id: spec.id.clone(),
+            status: status.clone(),
+            payload_json: payload_json.clone(),
+            observed_at_unix_ms: observed_at,
+        })),
+    };
+    if tx.send(msg).await.is_err() {
+        spool
+            .enqueue(PendingReport {
+                node_id: node_id.to_string(),
+                run_id,
+                spec_id: spec.id,
+                status,
+                payload_json,
+                observed_at_unix_ms: observed_at,
+                attempts: 1,
+            })
+            .await?;
     }
     Ok(())
 }
