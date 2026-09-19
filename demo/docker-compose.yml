@@ -1,0 +1,9 @@
+# Demo overlay: load demo/.env into the mysql service.
+# From repo root (via demo/up.sh):
+#   docker compose --env-file demo/.env -f docker-compose.yml -f demo/docker-compose.yml up -d
+name: novbot-demo
+
+services:
+  mysql:
+    env_file:
+      - .env
