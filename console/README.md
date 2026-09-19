@@ -82,13 +82,17 @@ The SPA uses relative `/v1` — no API host configuration is required in the bro
 | `npm run preview` | Preview the production build |
 | `npm run lint` | Oxlint |
 
-## Routes (P0 skeleton)
+## Routes (P0 wired)
 
-| Path | Page |
-|------|------|
-| `/` | Overview |
-| `/nodes` | Nodes list |
-| `/nodes/:nodeId` | Node detail (tabs: Config, Schedules, Dispatch, Results) |
-| `/results` | Global results |
+| Path | Page | API |
+|------|------|-----|
+| `/` | Overview aggregates | `GET /health`, `GET /v1/nodes`, `GET /v1/results` |
+| `/nodes` | Nodes list | `GET /v1/nodes` |
+| `/nodes/:nodeId/inventory` | Node inventory (read-only meta) | `GET /v1/nodes` + `GET /v1/nodes/:id/config` |
+| `/nodes/:nodeId/config` | Config editor | `GET/PUT /v1/nodes/:id/config` |
+| `/nodes/:nodeId/schedules` | Schedules editor | `GET/PUT /v1/nodes/:id/schedules` |
+| `/nodes/:nodeId/dispatch` | Dispatch form | `POST /v1/nodes/:id/dispatch` |
+| `/nodes/:nodeId/results` | Node-scoped results | `GET /v1/results?node_id=` |
+| `/results` | Global results (+ optional node filter) | `GET /v1/results` |
 
-Pages are stubs with layout and navigation; API wiring comes next via `src/api/client.ts`.
+Client: `src/api/client.ts` (relative `/v1` only).

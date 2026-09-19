@@ -6,6 +6,7 @@ import {
   NodeConfigTab,
   NodeDetailPage,
   NodeDispatchTab,
+  NodeInventoryTab,
   NodeResultsTab,
   NodeSchedulesTab,
 } from './pages/NodeDetailPage'
@@ -18,7 +19,8 @@ export default function App() {
         <Route index element={<OverviewPage />} />
         <Route path="nodes" element={<NodesListPage />} />
         <Route path="nodes/:nodeId" element={<NodeDetailPage />}>
-          <Route index element={<Navigate to="config" replace />} />
+          <Route index element={<Navigate to="inventory" replace />} />
+          <Route path="inventory" element={<NodeInventoryTab />} />
           <Route path="config" element={<NodeConfigTab />} />
           <Route path="schedules" element={<NodeSchedulesTab />} />
           <Route path="dispatch" element={<NodeDispatchTab />} />

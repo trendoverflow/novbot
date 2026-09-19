@@ -32,7 +32,7 @@ export function AppLayout() {
       </aside>
       <div className="main">
         <header className="topbar">
-          <span className="topbar-hint">OSS center console (scaffold)</span>
+          <span className="topbar-hint">OSS center console · live /v1</span>
         </header>
         <main className="content">
           <Outlet />
