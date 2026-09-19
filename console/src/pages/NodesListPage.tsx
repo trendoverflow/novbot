@@ -1,27 +1,70 @@
 import { Link } from 'react-router-dom'
-
-/** Demo rows for scaffold navigation only (not live API data). */
-const DEMO_NODES = ['demo-1', 'demo-2']
+import { api, formatTime } from '../api/client'
+import { Button, EmptyState, ErrorBanner, Loading, Toolbar } from '../components/Ui'
+import { useAsync } from '../hooks/useAsync'
 
 export function NodesListPage() {
+  const state = useAsync(() => api.listNodes(), [])
+
   return (
     <section>
       <h1 className="page-title">Nodes</h1>
       <p className="page-lead">
-        Registered nodes. List will call <code>GET /v1/nodes</code>.
+        Registered nodes from <code>GET /v1/nodes</code>.
       </p>
-      <div className="card">
-        <ul style={{ margin: 0, paddingLeft: '1.2rem' }}>
-          {DEMO_NODES.map((id) => (
-            <li key={id} style={{ marginBottom: '0.4rem' }}>
-              <Link to={`/nodes/${encodeURIComponent(id)}`}>{id}</Link>
-            </li>
-          ))}
-        </ul>
-        <p className="placeholder" style={{ marginTop: '1rem', marginBottom: 0 }}>
-          Placeholder list for layout / routing. Replace with live API data.
-        </p>
-      </div>
+
+      <Toolbar>
+        <Button variant="ghost" onClick={state.reload} disabled={state.status === 'loading'}>
+          Refresh
+        </Button>
+      </Toolbar>
+
+      {state.status === 'loading' ? <Loading /> : null}
+      {state.status === 'error' ? <ErrorBanner error={state.error} /> : null}
+
+      {state.status === 'ready' ? (
+        state.data.length === 0 ? (
+          <div className="card">
+            <EmptyState>
+              No nodes yet. A node appears after it connects over gRPC, or after{' '}
+              <code>PUT /v1/nodes/:id/config</code>.
+            </EmptyState>
+          </div>
+        ) : (
+          <div className="card table-wrap">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Node ID</th>
+                  <th>Hostname</th>
+                  <th>Version</th>
+                  <th>Last seen</th>
+                  <th>Labels</th>
+                </tr>
+              </thead>
+              <tbody>
+                {state.data.map((n) => (
+                  <tr key={n.node_id}>
+                    <td>
+                      <Link to={`/nodes/${encodeURIComponent(n.node_id)}`}>
+                        {n.node_id}
+                      </Link>
+                    </td>
+                    <td>{n.hostname || '—'}</td>
+                    <td className="mono">{n.version || '—'}</td>
+                    <td className="nowrap">{formatTime(n.last_seen_at)}</td>
+                    <td>
+                      <code className="labels">
+                        {JSON.stringify(n.labels ?? {})}
+                      </code>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )
+      ) : null}
     </section>
   )
 }
