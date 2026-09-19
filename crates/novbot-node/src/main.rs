@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Node daemon: Register → PullConfig (memory) → schedule probes → ReportResult + retry spool + single-file egress.
+//! Control.Session disconnects reconnect with exponential backoff; the process stays alive (M12).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
 use futures::StreamExt;
@@ -27,6 +28,8 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_MAX: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Parser)]
 #[command(name = "novbot-node", about = "NovBot node daemon")]
@@ -65,6 +68,9 @@ struct RuntimeState {
     last_run: HashMap<String, u64>,
 }
 
+/// Live Session outbound. `None` while disconnected — ReportResult goes to the retry spool.
+type SessionOut = Arc<RwLock<Option<mpsc::Sender<ClientMessage>>>>;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -83,45 +89,10 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(RwLock::new(RuntimeState::default()));
     let spool = Arc::new(RetrySpool::new(&args.data_dir));
-    let (outbound_tx, outbound_rx) = mpsc::channel::<ClientMessage>(64);
-    let outbound_tx = Arc::new(outbound_tx);
-
-    let mut client = ControlClient::connect(args.center_grpc.clone())
-        .await
-        .with_context(|| format!("connect {}", args.center_grpc))?;
-
-    let outbound = ReceiverStream::new(outbound_rx);
-    let mut inbound = client
-        .session(outbound)
-        .await
-        .context("open Session stream")?
-        .into_inner();
-
-    outbound_tx
-        .send(ClientMessage {
-            request_id: Uuid::new_v4().to_string(),
-            body: Some(client_message::Body::Register(RegisterRequest {
-                node_id: node_id.clone(),
-                hostname,
-                version: VERSION.into(),
-                bootstrap_token: args.bootstrap_token.clone().unwrap_or_default(),
-                labels: HashMap::new(),
-            })),
-        })
-        .await?;
-
-    outbound_tx
-        .send(ClientMessage {
-            request_id: Uuid::new_v4().to_string(),
-            body: Some(client_message::Body::PullConfig(PullConfigRequest {
-                node_id: node_id.clone(),
-                known_generation: 0,
-            })),
-        })
-        .await?;
+    let session_out: SessionOut = Arc::new(RwLock::new(None));
 
     {
-        let tx = outbound_tx.clone();
+        let out = session_out.clone();
         let node_id = node_id.clone();
         let state = state.clone();
         let every = Duration::from_secs(args.heartbeat_secs.max(5));
@@ -130,21 +101,23 @@ async fn main() -> Result<()> {
             loop {
                 ticker.tick().await;
                 let gen = state.read().await.config_generation;
-                let _ = tx
-                    .send(ClientMessage {
+                let _ = try_send(
+                    &out,
+                    ClientMessage {
                         request_id: Uuid::new_v4().to_string(),
                         body: Some(client_message::Body::Heartbeat(HeartbeatRequest {
                             node_id: node_id.clone(),
                             config_generation: gen,
                         })),
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
         });
     }
 
     {
-        let tx = outbound_tx.clone();
+        let out = session_out.clone();
         let node_id = node_id.clone();
         let state = state.clone();
         let spool = spool.clone();
@@ -154,7 +127,7 @@ async fn main() -> Result<()> {
             let mut ticker = tokio::time::interval(every);
             loop {
                 ticker.tick().await;
-                if let Err(e) = run_due(&node_id, &state, &spool, &data_dir, &tx, None).await {
+                if let Err(e) = run_due(&node_id, &state, &spool, &data_dir, &out, None).await {
                     tracing::warn!(error = %e, "scheduler tick failed");
                 }
             }
@@ -162,19 +135,99 @@ async fn main() -> Result<()> {
     }
 
     {
-        let tx = outbound_tx.clone();
+        let out = session_out.clone();
         let spool = spool.clone();
         let every = Duration::from_secs(args.retry_tick_secs.max(2));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(every);
             loop {
                 ticker.tick().await;
-                if let Err(e) = flush_spool(&spool, &tx).await {
+                if let Err(e) = flush_spool(&spool, &out).await {
                     tracing::warn!(error = %e, "retry flush failed");
                 }
             }
         });
     }
+
+    let mut backoff = RECONNECT_MIN;
+    loop {
+        match run_session(
+            &args,
+            &node_id,
+            &hostname,
+            &state,
+            &spool,
+            &session_out,
+        )
+        .await
+        {
+            Ok(()) => {
+                tracing::warn!("control stream closed; will reconnect");
+                backoff = RECONNECT_MIN;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "session error; will reconnect");
+            }
+        }
+        *session_out.write().await = None;
+        tracing::info!(secs = backoff.as_secs(), "reconnect backoff");
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff.saturating_mul(2)).min(RECONNECT_MAX);
+    }
+}
+
+async fn run_session(
+    args: &Args,
+    node_id: &str,
+    hostname: &str,
+    state: &Arc<RwLock<RuntimeState>>,
+    spool: &Arc<RetrySpool>,
+    session_out: &SessionOut,
+) -> Result<()> {
+    let mut client = ControlClient::connect(args.center_grpc.clone())
+        .await
+        .with_context(|| format!("connect {}", args.center_grpc))?;
+
+    let (tx, rx) = mpsc::channel::<ClientMessage>(64);
+    *session_out.write().await = Some(tx.clone());
+
+    let outbound = ReceiverStream::new(rx);
+    let mut inbound = client
+        .session(outbound)
+        .await
+        .context("open Session stream")?
+        .into_inner();
+
+    tx.send(ClientMessage {
+        request_id: Uuid::new_v4().to_string(),
+        body: Some(client_message::Body::Register(RegisterRequest {
+            node_id: node_id.to_string(),
+            hostname: hostname.to_string(),
+            version: VERSION.into(),
+            bootstrap_token: args.bootstrap_token.clone().unwrap_or_default(),
+            labels: HashMap::new(),
+        })),
+    })
+    .await
+    .context("send Register")?;
+
+    let known = state.read().await.config_generation;
+    tx.send(ClientMessage {
+        request_id: Uuid::new_v4().to_string(),
+        body: Some(client_message::Body::PullConfig(PullConfigRequest {
+            node_id: node_id.to_string(),
+            known_generation: known,
+        })),
+    })
+    .await
+    .context("send PullConfig")?;
+
+    // Flush any reports queued while disconnected.
+    if let Err(e) = flush_spool(spool, session_out).await {
+        tracing::warn!(error = %e, "post-reconnect spool flush failed");
+    }
+
+    tracing::info!("Control.Session connected");
 
     while let Some(frame) = inbound.next().await {
         let msg = match frame {
@@ -184,13 +237,35 @@ async fn main() -> Result<()> {
                 break;
             }
         };
-        if let Err(e) = on_server(&node_id, &state, &spool, &args.data_dir, &outbound_tx, msg).await
-        {
+        if let Err(e) = on_server(node_id, state, spool, &args.data_dir, session_out, msg).await {
             tracing::warn!(error = %e, "handle server message failed");
         }
     }
 
-    bail!("control stream closed")
+    Ok(())
+}
+
+async fn try_send(out: &SessionOut, msg: ClientMessage) -> bool {
+    let tx = out.read().await.clone();
+    if let Some(tx) = tx {
+        return tx.send(msg).await.is_ok();
+    }
+    false
+}
+
+async fn send_report_or_spool(
+    out: &SessionOut,
+    spool: &RetrySpool,
+    msg: ClientMessage,
+    pending: PendingReport,
+) -> Result<()> {
+    if try_send(out, msg).await {
+        return Ok(());
+    }
+    let run_id = pending.run_id.clone();
+    spool.enqueue(pending).await?;
+    tracing::warn!(%run_id, "ReportResult queued to retry spool");
+    Ok(())
 }
 
 async fn resolve_node_id(args: &Args) -> Result<String> {
@@ -215,7 +290,7 @@ async fn on_server(
     state: &Arc<RwLock<RuntimeState>>,
     spool: &Arc<RetrySpool>,
     data_dir: &PathBuf,
-    tx: &mpsc::Sender<ClientMessage>,
+    out: &SessionOut,
     msg: ServerMessage,
 ) -> Result<()> {
     let Some(body) = msg.body else {
@@ -232,14 +307,17 @@ async fn on_server(
         server_message::Body::Heartbeat(resp) => {
             let local = state.read().await.config_generation;
             if resp.center_config_generation > local {
-                tx.send(ClientMessage {
-                    request_id: Uuid::new_v4().to_string(),
-                    body: Some(client_message::Body::PullConfig(PullConfigRequest {
-                        node_id: node_id.to_string(),
-                        known_generation: local,
-                    })),
-                })
-                .await?;
+                let _ = try_send(
+                    out,
+                    ClientMessage {
+                        request_id: Uuid::new_v4().to_string(),
+                        body: Some(client_message::Body::PullConfig(PullConfigRequest {
+                            node_id: node_id.to_string(),
+                            known_generation: local,
+                        })),
+                    },
+                )
+                .await;
             }
         }
         server_message::Body::PullConfig(resp) => {
@@ -271,7 +349,7 @@ async fn on_server(
             tracing::info!(generation = push.config_generation, "schedules pushed");
         }
         server_message::Body::Dispatch(d) => {
-            run_dispatch(node_id, state, spool, data_dir, tx, &d).await?;
+            run_dispatch(node_id, state, spool, data_dir, out, &d).await?;
         }
         server_message::Body::ReportResult(_)
         | server_message::Body::Ack(_)
@@ -306,7 +384,7 @@ async fn run_due(
     state: &Arc<RwLock<RuntimeState>>,
     spool: &Arc<RetrySpool>,
     data_dir: &PathBuf,
-    tx: &mpsc::Sender<ClientMessage>,
+    out: &SessionOut,
     only_spec: Option<&str>,
 ) -> Result<()> {
     let specs: Vec<Spec> = {
@@ -351,30 +429,27 @@ async fn run_due(
             tracing::warn!(error = %e, "egress write failed");
         }
 
+        let pending = PendingReport {
+            node_id: node_id.to_string(),
+            run_id: run_id.clone(),
+            spec_id: spec.id.clone(),
+            status: status.clone(),
+            payload_json: payload_json.clone(),
+            observed_at_unix_ms: observed_at,
+            attempts: 1,
+        };
         let msg = ClientMessage {
             request_id: Uuid::new_v4().to_string(),
             body: Some(client_message::Body::ReportResult(ReportResultRequest {
                 node_id: node_id.to_string(),
-                run_id: run_id.clone(),
-                spec_id: spec.id.clone(),
-                status: status.clone(),
-                payload_json: payload_json.clone(),
+                run_id,
+                spec_id: spec.id,
+                status,
+                payload_json,
                 observed_at_unix_ms: observed_at,
             })),
         };
-        if tx.send(msg).await.is_err() {
-            spool
-                .enqueue(PendingReport {
-                    node_id: node_id.to_string(),
-                    run_id,
-                    spec_id: spec.id,
-                    status,
-                    payload_json,
-                    observed_at_unix_ms: observed_at,
-                    attempts: 1,
-                })
-                .await?;
-        }
+        send_report_or_spool(out, spool, msg, pending).await?;
     }
     Ok(())
 }
@@ -384,7 +459,7 @@ async fn run_dispatch(
     state: &Arc<RwLock<RuntimeState>>,
     spool: &Arc<RetrySpool>,
     data_dir: &PathBuf,
-    tx: &mpsc::Sender<ClientMessage>,
+    out: &SessionOut,
     d: &Dispatch,
 ) -> Result<()> {
     let mut spec = {
@@ -432,34 +507,35 @@ async fn run_dispatch(
         tracing::warn!(error = %e, "egress write failed");
     }
 
+    let pending = PendingReport {
+        node_id: node_id.to_string(),
+        run_id: run_id.clone(),
+        spec_id: spec.id.clone(),
+        status: status.clone(),
+        payload_json: payload_json.clone(),
+        observed_at_unix_ms: observed_at,
+        attempts: 1,
+    };
     let msg = ClientMessage {
         request_id: Uuid::new_v4().to_string(),
         body: Some(client_message::Body::ReportResult(ReportResultRequest {
             node_id: node_id.to_string(),
-            run_id: run_id.clone(),
-            spec_id: spec.id.clone(),
-            status: status.clone(),
-            payload_json: payload_json.clone(),
+            run_id,
+            spec_id: spec.id,
+            status,
+            payload_json,
             observed_at_unix_ms: observed_at,
         })),
     };
-    if tx.send(msg).await.is_err() {
-        spool
-            .enqueue(PendingReport {
-                node_id: node_id.to_string(),
-                run_id,
-                spec_id: spec.id,
-                status,
-                payload_json,
-                observed_at_unix_ms: observed_at,
-                attempts: 1,
-            })
-            .await?;
-    }
+    send_report_or_spool(out, spool, msg, pending).await?;
     Ok(())
 }
 
-async fn flush_spool(spool: &RetrySpool, tx: &mpsc::Sender<ClientMessage>) -> Result<()> {
+async fn flush_spool(spool: &RetrySpool, out: &SessionOut) -> Result<()> {
+    let connected = out.read().await.is_some();
+    if !connected {
+        return Ok(());
+    }
     let items = spool.drain().await?;
     for mut item in items {
         let msg = ClientMessage {
@@ -473,7 +549,7 @@ async fn flush_spool(spool: &RetrySpool, tx: &mpsc::Sender<ClientMessage>) -> Re
                 observed_at_unix_ms: item.observed_at_unix_ms,
             })),
         };
-        if tx.send(msg).await.is_err() {
+        if !try_send(out, msg).await {
             item.attempts = item.attempts.saturating_add(1);
             spool.enqueue(item).await?;
             break;

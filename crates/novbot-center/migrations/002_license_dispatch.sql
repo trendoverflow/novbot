@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS pending_dispatches (
   node_id VARCHAR(128) NOT NULL,
   run_id VARCHAR(64) NOT NULL,
   spec_id VARCHAR(128) NOT NULL,
-  params_json JSON NOT NULL,
+  params_json LONGTEXT NOT NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   INDEX idx_pending_dispatch_node (node_id),
   CONSTRAINT fk_pending_dispatch_node FOREIGN KEY (node_id) REFERENCES nodes(node_id) ON DELETE CASCADE

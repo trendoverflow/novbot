@@ -59,6 +59,10 @@ impl Db {
                 "002_license_dispatch.sql",
                 include_str!("../migrations/002_license_dispatch.sql"),
             ),
+            (
+                "003_json_to_longtext.sql",
+                include_str!("../migrations/003_json_to_longtext.sql"),
+            ),
         ] {
             for stmt in split_sql(sql) {
                 sqlx::query(stmt)
@@ -81,7 +85,7 @@ impl Db {
         sqlx::query(
             r#"
             INSERT INTO nodes (node_id, hostname, version, labels_json, last_seen_at)
-            VALUES (?, ?, ?, CAST(? AS JSON), CURRENT_TIMESTAMP(3))
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3))
             ON DUPLICATE KEY UPDATE
               hostname = VALUES(hostname),
               version = VALUES(version),
@@ -99,7 +103,7 @@ impl Db {
         sqlx::query(
             r#"
             INSERT IGNORE INTO node_configs (node_id, config_generation, specs_json, schedules_json)
-            VALUES (?, 1, CAST('[]' AS JSON), CAST('[]' AS JSON))
+            VALUES (?, 1, '[]', '[]')
             "#,
         )
         .bind(node_id)
@@ -172,7 +176,7 @@ impl Db {
         sqlx::query(
             r#"
             INSERT INTO node_configs (node_id, config_generation, specs_json, schedules_json)
-            VALUES (?, 1, CAST(? AS JSON), CAST(? AS JSON))
+            VALUES (?, 1, ?, ?)
             ON DUPLICATE KEY UPDATE
               config_generation = config_generation + 1,
               specs_json = VALUES(specs_json),
@@ -195,7 +199,7 @@ impl Db {
         let res = sqlx::query(
             r#"
             UPDATE node_configs
-            SET schedules_json = CAST(? AS JSON),
+            SET schedules_json = ?,
                 config_generation = config_generation + 1
             WHERE node_id = ?
             "#,
@@ -224,7 +228,7 @@ impl Db {
         sqlx::query(
             r#"
             INSERT INTO results (node_id, run_id, spec_id, status, payload_json, observed_at)
-            VALUES (?, ?, ?, ?, CAST(? AS JSON), ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(node_id)
@@ -290,7 +294,7 @@ impl Db {
         let res = sqlx::query(
             r#"
             INSERT INTO pending_dispatches (node_id, run_id, spec_id, params_json)
-            VALUES (?, ?, ?, CAST(? AS JSON))
+            VALUES (?, ?, ?, ?)
             "#,
         )
         .bind(node_id)
