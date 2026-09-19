@@ -21,10 +21,24 @@ pub enum SpecKind {
     Cpu,
     Memory,
     Disk,
-    /// Thin compliance: assert a path exists (open-source path).
+    /// Thin compliance: assert a path exists.
     CompliancePath,
+    /// sshd_config checks (PermitRootLogin, PasswordAuthentication).
+    ComplianceSshd,
+    /// Sample listening TCP ports from /proc/net/tcp{,6}.
+    ComplianceListeningPorts,
+    /// World-writable paths under a root (default /etc), bounded walk.
+    ComplianceWorldWritable,
+    /// NTP / time sync status when tools exist.
+    ComplianceNtp,
+    /// Reboot-required marker (e.g. /var/run/reboot-required).
+    ComplianceRebootRequired,
     /// Escape hatch: bounded shell command.
     Exec,
+    /// Named in-process skill (DispatchCommand / schedule).
+    Skill,
+    /// MCP-style tool invocation (same registry as Skill; args under params.arguments).
+    McpTool,
 }
 
 pub fn parse_specs_json(raw: &str) -> Result<Vec<Spec>, serde_json::Error> {
@@ -40,9 +54,11 @@ mod tests {
 
     #[test]
     fn parses_specs() {
-        let raw = r#"[{"id":"cpu","kind":"cpu"},{"id":"disk-root","kind":"disk","params":{"mount":"/"}}]"#;
+        let raw = r#"[{"id":"cpu","kind":"cpu"},{"id":"disk-root","kind":"disk","params":{"mount":"/"}},{"id":"skill1","kind":"skill","params":{"skill":"host_info"}},{"id":"mcp1","kind":"mcp_tool","params":{"tool":"echo","arguments":{"text":"hi"}}}]"#;
         let specs = parse_specs_json(raw).unwrap();
-        assert_eq!(specs.len(), 2);
+        assert_eq!(specs.len(), 4);
         assert_eq!(specs[0].kind, SpecKind::Cpu);
+        assert_eq!(specs[2].kind, SpecKind::Skill);
+        assert_eq!(specs[3].kind, SpecKind::McpTool);
     }
 }

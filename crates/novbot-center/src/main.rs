@@ -4,9 +4,11 @@
 mod db;
 mod grpc;
 mod http;
+mod hub;
 
 use anyhow::Context;
 use clap::Parser;
+use hub::Hub;
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -26,6 +28,10 @@ struct Args {
     /// Optional shared bootstrap token required on Register.
     #[arg(long, env = "NOVBOT_BOOTSTRAP_TOKEN")]
     bootstrap_token: Option<String>,
+
+    /// Stub license key (M7). When set, EE report paths open.
+    #[arg(long, env = "NOVBOT_LICENSE_KEY")]
+    license_key: Option<String>,
 }
 
 #[tokio::main]
@@ -40,19 +46,23 @@ async fn main() -> anyhow::Result<()> {
         .context("database")?;
     db.migrate().await.context("migrate")?;
 
+    let hub = Hub::new();
     let db_grpc = db.clone();
     let db_http = db;
+    let hub_grpc = hub.clone();
+    let hub_http = hub;
     let token = args.bootstrap_token.clone();
+    let license = args.license_key.clone();
     let grpc_addr = args.grpc_addr;
     let http_addr = args.http_addr;
 
     let grpc = tokio::spawn(async move {
-        if let Err(e) = grpc::serve(grpc_addr, db_grpc, token).await {
+        if let Err(e) = grpc::serve(grpc_addr, db_grpc, hub_grpc, token).await {
             tracing::error!(error = %e, "gRPC server exited");
         }
     });
     let http = tokio::spawn(async move {
-        if let Err(e) = http::serve(http_addr, db_http).await {
+        if let Err(e) = http::serve(http_addr, db_http, hub_http, license).await {
             tracing::error!(error = %e, "HTTP server exited");
         }
     });

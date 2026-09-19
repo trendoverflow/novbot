@@ -53,12 +53,19 @@ impl Db {
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        let sql = include_str!("../migrations/001_init.sql");
-        for stmt in split_sql(sql) {
-            sqlx::query(stmt)
-                .execute(&self.pool)
-                .await
-                .with_context(|| format!("migrate: {}", &stmt[..stmt.len().min(60)]))?;
+        for (name, sql) in [
+            ("001_init.sql", include_str!("../migrations/001_init.sql")),
+            (
+                "002_license_dispatch.sql",
+                include_str!("../migrations/002_license_dispatch.sql"),
+            ),
+        ] {
+            for stmt in split_sql(sql) {
+                sqlx::query(stmt)
+                    .execute(&self.pool)
+                    .await
+                    .with_context(|| format!("migrate {name}: {}", &stmt[..stmt.len().min(60)]))?;
+            }
         }
         Ok(())
     }
@@ -270,6 +277,97 @@ impl Db {
             });
         }
         Ok(out)
+    }
+
+    pub async fn enqueue_dispatch(
+        &self,
+        node_id: &str,
+        run_id: &str,
+        spec_id: &str,
+        params_json: &str,
+    ) -> Result<i64> {
+        let _: Value = serde_json::from_str(params_json).context("params_json")?;
+        let res = sqlx::query(
+            r#"
+            INSERT INTO pending_dispatches (node_id, run_id, spec_id, params_json)
+            VALUES (?, ?, ?, CAST(? AS JSON))
+            "#,
+        )
+        .bind(node_id)
+        .bind(run_id)
+        .bind(spec_id)
+        .bind(params_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.last_insert_id() as i64)
+    }
+
+    pub async fn take_pending_dispatches(
+        &self,
+        node_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, run_id, spec_id, params_json
+            FROM pending_dispatches WHERE node_id = ? ORDER BY id ASC
+            "#,
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        let mut ids = Vec::new();
+        for r in rows {
+            let id: i64 = r.try_get("id")?;
+            ids.push(id);
+            let run_id: String = r.try_get("run_id")?;
+            let spec_id: String = r.try_get("spec_id")?;
+            let params_raw: String = r.try_get("params_json")?;
+            let params: Value = serde_json::from_str(&params_raw)
+                .unwrap_or_else(|_| Value::Object(Default::default()));
+            out.push((run_id, spec_id, serde_json::to_string(&params)?));
+        }
+        for id in ids {
+            sqlx::query("DELETE FROM pending_dispatches WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(out)
+    }
+
+    pub async fn get_license_key(&self) -> Result<String> {
+        let row = sqlx::query("SELECT license_key FROM license_state WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(r) => r.try_get::<String, _>("license_key").unwrap_or_default(),
+            None => String::new(),
+        })
+    }
+
+    pub async fn set_license_key(&self, key: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO license_state (id, license_key) VALUES (1, ?)
+            ON DUPLICATE KEY UPDATE license_key = VALUES(license_key)
+            "#,
+        )
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn is_licensed(&self, env_key: Option<&str>) -> Result<bool> {
+        if let Some(k) = env_key {
+            if !k.is_empty() {
+                return Ok(true);
+            }
+        }
+        let key = self.get_license_key().await?;
+        Ok(!key.trim().is_empty())
     }
 
     pub async fn config_generation(&self, node_id: &str) -> Result<i64> {

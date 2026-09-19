@@ -1,0 +1,18 @@
+CREATE TABLE IF NOT EXISTS license_state (
+  id TINYINT PRIMARY KEY DEFAULT 1,
+  license_key VARCHAR(512) NOT NULL DEFAULT '',
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT IGNORE INTO license_state (id, license_key) VALUES (1, '');
+
+CREATE TABLE IF NOT EXISTS pending_dispatches (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  node_id VARCHAR(128) NOT NULL,
+  run_id VARCHAR(64) NOT NULL,
+  spec_id VARCHAR(128) NOT NULL,
+  params_json JSON NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  INDEX idx_pending_dispatch_node (node_id),
+  CONSTRAINT fk_pending_dispatch_node FOREIGN KEY (node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
