@@ -5,3 +5,6 @@
 .env.*
 !.env.example
 /data/
+/console/node_modules/
+/console/dist/
+/console/.certs/

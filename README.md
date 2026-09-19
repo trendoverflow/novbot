@@ -17,8 +17,13 @@ Apache-2.0. See [LICENSE](LICENSE).
 | `novbot-node` | Long-running daemon; pull-on-boot config into memory; scheduled / dispatched probes; report + retry spool; single-file egress |
 | `novbot-core` | Shared JSON specs, probes, skills/MCP tools, schedules, retry spool |
 | `novbot-proto` | `novbot.v1.Control` protobuf |
+| `console/` | OSS center console (React + TypeScript + Vite); browser calls same-origin `/v1` |
 
-**Out of OSS MVP:** EE report packs, UI, design docs in-repo.
+**Out of OSS MVP:** EE report packs, product design docs in-repo.
+
+## Center console
+
+See [`console/`](console/) for the web UI scaffold (`npm install` / `npm run dev` with Vite proxy to center).
 
 ## Prerequisites
 
