@@ -1,0 +1,22 @@
+# Optional MySQL for local development. Bring-your-own MySQL is the primary path.
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: novbot
+      MYSQL_USER: novbot
+      MYSQL_PASSWORD: novbot
+    ports:
+      - "3306:3306"
+    volumes:
+      - novbot_mysql:/var/lib/mysql
+    command: ["--default-authentication-plugin=caching_sha2_password", "--character-set-server=utf8mb4"]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  novbot_mysql:
