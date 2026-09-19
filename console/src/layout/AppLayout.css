@@ -441,3 +441,28 @@ select.input {
 .form-stack {
   max-width: 40rem;
 }
+
+
+.check-list {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: #fff;
+  cursor: pointer;
+}
+
+.check-row:hover {
+  border-color: #cbd5e1;
+}

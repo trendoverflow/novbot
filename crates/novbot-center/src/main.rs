@@ -32,6 +32,10 @@ struct Args {
     /// Stub license key (M7). When set, EE report paths open.
     #[arg(long, env = "NOVBOT_LICENSE_KEY")]
     license_key: Option<String>,
+
+    /// Optional HTTP API Bearer token. When set, `/v1` requires Authorization: Bearer <token>.
+    #[arg(long, env = "NOVBOT_API_TOKEN")]
+    api_token: Option<String>,
 }
 
 #[tokio::main]
@@ -53,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let hub_http = hub;
     let token = args.bootstrap_token.clone();
     let license = args.license_key.clone();
+    let api_token = args.api_token.clone();
     let grpc_addr = args.grpc_addr;
     let http_addr = args.http_addr;
 
@@ -62,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     let http = tokio::spawn(async move {
-        if let Err(e) = http::serve(http_addr, db_http, hub_http, license).await {
+        if let Err(e) = http::serve(http_addr, db_http, hub_http, license, api_token).await {
             tracing::error!(error = %e, "HTTP server exited");
         }
     });
