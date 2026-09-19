@@ -11,6 +11,12 @@ import {
   NodeSchedulesTab,
 } from './pages/NodeDetailPage'
 import { ResultsPage } from './pages/ResultsPage'
+import { FleetSkillGroupsPage } from './pages/FleetSkillGroupsPage'
+import {
+  SettingsApiPage,
+  SettingsIndexRedirect,
+  SettingsLayout,
+} from './pages/SettingsPage'
 
 export default function App() {
   return (
@@ -27,6 +33,11 @@ export default function App() {
           <Route path="results" element={<NodeResultsTab />} />
         </Route>
         <Route path="results" element={<ResultsPage />} />
+        <Route path="fleet/skill-groups" element={<FleetSkillGroupsPage />} />
+        <Route path="settings" element={<SettingsLayout />}>
+          <Route index element={<SettingsIndexRedirect />} />
+          <Route path="api" element={<SettingsApiPage />} />
+        </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

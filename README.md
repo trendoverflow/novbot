@@ -59,6 +59,7 @@ cargo test --workspace
 export NOVBOT_DATABASE_URL='mysql://novbot:novbot@127.0.0.1:3306/novbot'
 # optional: export NOVBOT_BOOTSTRAP_TOKEN=secret
 # optional stub license: export NOVBOT_LICENSE_KEY=dev-license
+# optional HTTP Bearer: export NOVBOT_API_TOKEN=dev-token
 cargo run -p novbot-center -- \
   --database-url "$NOVBOT_DATABASE_URL" \
   --grpc-addr 0.0.0.0:50051 \
@@ -164,7 +165,12 @@ Enable with `NOVBOT_LICENSE_KEY` or `PUT /v1/license` `{"key":"..."}` (stub acce
 | GET | `/v1/results?node_id=&limit=` | Recent probe results |
 | GET/PUT | `/v1/license` | License stub status / set key |
 | GET | `/v1/skills` | List built-in skills/tools |
+| GET | `/v1/fleet/skill-groups` | Predefined fleet skill groups |
+| POST | `/v1/fleet/skill-groups/push` | Push a skill group to selected nodes |
+| GET/POST | `/v1/tokens` | Bearer token stub (status / mint paste-ready token) |
 | GET | `/v1/ee/reports` | EE reports (license-gated stub) |
+
+Optional HTTP auth: set `NOVBOT_API_TOKEN` so `/v1` requires `Authorization: Bearer <token>`. `/health` stays open.
 
 ## gRPC
 

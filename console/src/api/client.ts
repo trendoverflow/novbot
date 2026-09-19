@@ -1,12 +1,12 @@
 /**
  * NovBot center HTTP API client.
  *
- * Browser traffic must stay same-origin HTTPS `/v1` (relative path in production).
- * In Vite dev, `vite.config.ts` proxies `/v1` (and `/health`) to the center.
+ * Default: relative `/v1` (Vite proxy / same-origin production).
+ * Settings may set an absolute base URL (http/https) and Bearer token.
  * Shapes match crates/novbot-center/src/http.rs + db.rs.
  */
 
-const API_BASE = '/v1'
+import { loadSettings } from './settings'
 
 export class ApiError extends Error {
   readonly status: number
@@ -28,13 +28,31 @@ function apiErrorMessage(status: number, body: unknown): string {
   return `API ${status}`
 }
 
+function v1Base(): string {
+  const base = loadSettings().baseUrl.trim().replace(/\/+$/, '')
+  if (!base) return '/v1'
+  return `${base}/v1`
+}
+
+function healthPath(): string {
+  const base = loadSettings().baseUrl.trim().replace(/\/+$/, '')
+  if (!base) return '/health'
+  return `${base}/health`
+}
+
+function authHeaders(): Record<string, string> {
+  const token = loadSettings().token.trim()
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const url = path.startsWith('http') ? path : `${API_BASE}${path}`
+  const url = path.startsWith('http') ? path : `${v1Base()}${path}`
   const res = await fetch(url, {
     ...init,
     headers: {
       Accept: 'application/json',
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...authHeaders(),
       ...init?.headers,
     },
   })
@@ -55,11 +73,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T
 }
 
-async function requestAbsolute<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
+async function requestHealth<T>(init?: RequestInit): Promise<T> {
+  const res = await fetch(healthPath(), {
     ...init,
     headers: {
       Accept: 'application/json',
+      ...authHeaders(),
       ...init?.headers,
     },
   })
@@ -147,8 +166,55 @@ export type ListResultsQuery = {
   limit?: number
 }
 
+export type SkillGroup = {
+  id: string
+  name: string
+  description?: string
+  skills: string[]
+}
+
+export type SkillGroupsResponse = {
+  groups: SkillGroup[]
+  note?: string
+}
+
+export type PushSkillGroupBody = {
+  group_id: string
+  node_ids: string[]
+}
+
+export type PushSkillGroupResultRow = {
+  node_id: string
+  skill?: string | null
+  spec_id?: string
+  run_id?: string
+  status: string
+  delivered?: string
+  error?: string
+}
+
+export type PushSkillGroupResponse = {
+  accepted: boolean
+  group_id: string
+  group_name?: string
+  skills?: string[]
+  results: PushSkillGroupResultRow[]
+}
+
+export type TokensStatus = {
+  auth_required: boolean
+  stub?: boolean
+  note?: string
+}
+
+export type CreateTokenResponse = {
+  token: string
+  stub?: boolean
+  note?: string
+}
+
 export const api = {
-  health: () => requestAbsolute<HealthResponse>('/health'),
+  health: () => requestHealth<HealthResponse>(),
 
   listNodes: () => request<NodeSummary[]>('/nodes'),
 
@@ -188,6 +254,19 @@ export const api = {
     const qs = params.toString()
     return request<ResultRow[]>(`/results${qs ? `?${qs}` : ''}`)
   },
+
+  listSkillGroups: () => request<SkillGroupsResponse>('/fleet/skill-groups'),
+
+  pushSkillGroup: (body: PushSkillGroupBody) =>
+    request<PushSkillGroupResponse>('/fleet/skill-groups/push', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  tokensStatus: () => request<TokensStatus>('/tokens'),
+
+  createToken: () =>
+    request<CreateTokenResponse>('/tokens', { method: 'POST' }),
 }
 
 /** Parse specs_json / schedules_json from NodeConfig for editors. */

@@ -1,10 +1,29 @@
 import { NavLink, Outlet } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { loadSettings, settingsEventName } from '../api/settings'
 import './AppLayout.css'
 
 const navClass = ({ isActive }: { isActive: boolean }) =>
   isActive ? 'nav-link active' : 'nav-link'
 
 export function AppLayout() {
+  const [conn, setConn] = useState(() => loadSettings())
+
+  useEffect(() => {
+    const sync = () => setConn(loadSettings())
+    window.addEventListener(settingsEventName(), sync)
+    window.addEventListener('storage', sync)
+    return () => {
+      window.removeEventListener(settingsEventName(), sync)
+      window.removeEventListener('storage', sync)
+    }
+  }, [])
+
+  const foot = conn.baseUrl
+    ? conn.baseUrl
+    : '/v1 same-origin'
+  const tokenHint = conn.token ? ' · Bearer on' : ''
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -25,9 +44,18 @@ export function AppLayout() {
           <NavLink to="/results" className={navClass}>
             Results
           </NavLink>
+          <NavLink to="/fleet/skill-groups" className={navClass}>
+            Fleet
+          </NavLink>
+          <NavLink to="/settings" className={navClass}>
+            Settings
+          </NavLink>
         </nav>
         <div className="sidebar-foot">
-          <code>/v1</code> same-origin
+          <code title={foot}>
+            {foot.length > 28 ? `${foot.slice(0, 26)}…` : foot}
+          </code>
+          {tokenHint}
         </div>
       </aside>
       <div className="main">

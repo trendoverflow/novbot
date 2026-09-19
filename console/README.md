@@ -2,7 +2,7 @@
 
 React + TypeScript + Vite UI for the open-source NovBot control center.
 
-The browser talks **only** to same-origin HTTPS **`/v1`** (relative path in production). Never point the client at a raw `http://` center URL from the browser.
+By default the browser talks to same-origin **`/v1`** (relative path; Vite proxies in dev). **Settings → API** may set an absolute `http://` / `https://` base URL and a Bearer token (stored in `localStorage`) for demos against a remote center.
 
 ## Prerequisites
 
@@ -82,7 +82,7 @@ The SPA uses relative `/v1` — no API host configuration is required in the bro
 | `npm run preview` | Preview the production build |
 | `npm run lint` | Oxlint |
 
-## Routes (P0 wired)
+## Routes
 
 | Path | Page | API |
 |------|------|-----|
@@ -94,5 +94,7 @@ The SPA uses relative `/v1` — no API host configuration is required in the bro
 | `/nodes/:nodeId/dispatch` | Dispatch form | `POST /v1/nodes/:id/dispatch` |
 | `/nodes/:nodeId/results` | Node-scoped results | `GET /v1/results?node_id=` |
 | `/results` | Global results (+ optional node filter) | `GET /v1/results` |
+| `/fleet/skill-groups` | Fleet skill-group push | `GET /v1/fleet/skill-groups`, `POST .../push`, `GET /v1/nodes` |
+| `/settings/api` | API base URL + Bearer token | `localStorage`; `GET/POST /v1/tokens` |
 
-Client: `src/api/client.ts` (relative `/v1` only).
+Client: `src/api/client.ts` (+ `src/api/settings.ts`). Empty base URL → relative `/v1`; otherwise absolute `{base}/v1` with optional `Authorization: Bearer`.
