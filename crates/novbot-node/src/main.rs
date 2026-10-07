@@ -4,9 +4,12 @@
 //! Node daemon: Register → PullConfig (memory) → schedule probes → ReportResult + retry spool + single-file egress.
 //! Control.Session disconnects reconnect with exponential backoff; the process stays alive (M12).
 
+mod config;
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
+use config::Secret;
 use futures::StreamExt;
 use novbot_core::{
     due_specs, parse_schedules_json, parse_specs_json, run_probe, write_egress_result,
@@ -34,21 +37,25 @@ const RECONNECT_MAX: Duration = Duration::from_secs(60);
 #[derive(Debug, Parser)]
 #[command(name = "novbot-node", about = "NovBot node daemon")]
 struct Args {
-    /// Center gRPC endpoint, e.g. http://127.0.0.1:50051
-    #[arg(long, env = "NOVBOT_CENTER_GRPC")]
-    center_grpc: String,
+    /// Center gRPC endpoint (env: NOVBOT_CENTER_GRPC), for example http://127.0.0.1:50051.
+    #[arg(long)]
+    center_grpc: Option<String>,
 
-    /// Stable node id. If omitted, generated and persisted under --data-dir.
-    #[arg(long, env = "NOVBOT_NODE_ID")]
+    /// Stable node id (env: NOVBOT_NODE_ID).
+    #[arg(long)]
     node_id: Option<String>,
 
-    /// Local data directory (retry spool + last_result.json + node_id). Not business config.
+    /// Optional bootstrap token for Register (env: NOVBOT_BOOTSTRAP_TOKEN).
+    #[arg(long)]
+    bootstrap_token: Option<Secret>,
+
+    /// TOML file with center_grpc, node_id, and bootstrap_token only (env: NOVBOT_CONFIG).
+    #[arg(long, env = "NOVBOT_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Local data directory (retry spool + last_result.json). Not business config.
     #[arg(long, env = "NOVBOT_DATA_DIR", default_value = "./data")]
     data_dir: PathBuf,
-
-    /// Optional bootstrap token for Register.
-    #[arg(long, env = "NOVBOT_BOOTSTRAP_TOKEN")]
-    bootstrap_token: Option<String>,
 
     /// Node labels sent on Register, as comma-separated key=value pairs (e.g. "role=db,env=demo").
     #[arg(long, env = "NOVBOT_NODE_LABELS", default_value = "")]
@@ -82,14 +89,40 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let cfg = match load_node_config(&args) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("novbot-node: {err}");
+            std::process::exit(2);
+        }
+    };
+    let (bootstrap_token, bootstrap_token_source) = match &cfg.bootstrap_token {
+        Some(token) => ("set", token.source.to_string()),
+        None => ("unset", String::new()),
+    };
+    let config_file = cfg
+        .config_file
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    tracing::info!(
+        center = %cfg.center_grpc.value,
+        center_source = %cfg.center_grpc.source,
+        node_id = %cfg.node_id.value,
+        node_id_source = %cfg.node_id.source,
+        bootstrap_token,
+        bootstrap_token_source = %bootstrap_token_source,
+        config_file = %config_file,
+        "starting novbot-node"
+    );
+    resolve_center_dns(&cfg.center_grpc.value).await;
+
     tokio::fs::create_dir_all(&args.data_dir).await?;
-    let node_id = resolve_node_id(&args).await?;
+    let node_id = cfg.node_id.value.clone();
     let hostname = hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown".into());
-
-    tracing::info!(%node_id, center = %args.center_grpc, "starting novbot-node");
 
     let state = Arc::new(RwLock::new(RuntimeState::default()));
     let spool = Arc::new(RetrySpool::new(&args.data_dir));
@@ -155,22 +188,17 @@ async fn main() -> Result<()> {
 
     let mut backoff = RECONNECT_MIN;
     loop {
-        match run_session(
-            &args,
-            &node_id,
-            &hostname,
-            &state,
-            &spool,
-            &session_out,
-        )
-        .await
-        {
+        match run_session(&args, &cfg, &hostname, &state, &spool, &session_out).await {
             Ok(()) => {
                 tracing::warn!("control stream closed; will reconnect");
                 backoff = RECONNECT_MIN;
             }
             Err(e) => {
-                tracing::error!(error = %e, "session error; will reconnect");
+                tracing::error!(
+                    center = %cfg.center_grpc.value,
+                    error = %format!("{e:#}"),
+                    "center session failed; will reconnect"
+                );
             }
         }
         *session_out.write().await = None;
@@ -180,17 +208,47 @@ async fn main() -> Result<()> {
     }
 }
 
+fn load_node_config(args: &Args) -> Result<config::NodeConfig, config::ConfigError> {
+    let file = match &args.config {
+        Some(path) => Some((path.clone(), config::load_file_config(path)?)),
+        None => None,
+    };
+    config::resolve(
+        config::CliValues {
+            center_grpc: args.center_grpc.clone(),
+            node_id: args.node_id.clone(),
+            bootstrap_token: args.bootstrap_token.clone(),
+        },
+        |key| std::env::var(key).ok(),
+        file,
+    )
+}
+
+async fn resolve_center_dns(addr: &config::CenterAddr) {
+    match tokio::net::lookup_host((addr.host.as_str(), addr.port)).await {
+        Ok(lookup) => {
+            let ips: Vec<String> = lookup.map(|socket| socket.ip().to_string()).collect();
+            tracing::info!(address = %addr, ?ips, "center address resolved");
+        }
+        Err(error) => {
+            tracing::warn!(address = %addr, %error, "center DNS lookup failed");
+        }
+    }
+}
+
 async fn run_session(
     args: &Args,
-    node_id: &str,
+    cfg: &config::NodeConfig,
     hostname: &str,
     state: &Arc<RwLock<RuntimeState>>,
     spool: &Arc<RetrySpool>,
     session_out: &SessionOut,
 ) -> Result<()> {
-    let mut client = ControlClient::connect(args.center_grpc.clone())
+    let center = cfg.center_grpc.value.uri.clone();
+    let node_id = cfg.node_id.value.as_str();
+    let mut client = ControlClient::connect(center.clone())
         .await
-        .with_context(|| format!("connect {}", args.center_grpc))?;
+        .with_context(|| format!("connect {center}"))?;
 
     let (tx, rx) = mpsc::channel::<ClientMessage>(64);
     *session_out.write().await = Some(tx.clone());
@@ -208,7 +266,11 @@ async fn run_session(
             node_id: node_id.to_string(),
             hostname: hostname.to_string(),
             version: VERSION.into(),
-            bootstrap_token: args.bootstrap_token.clone().unwrap_or_default(),
+            bootstrap_token: cfg
+                .bootstrap_token
+                .as_ref()
+                .map(|token| token.value.expose().to_string())
+                .unwrap_or_default(),
             labels: parse_labels(&args.labels),
         })),
     })
@@ -284,23 +346,6 @@ async fn send_report_or_spool(
     spool.enqueue(pending).await?;
     tracing::warn!(%run_id, "ReportResult queued to retry spool");
     Ok(())
-}
-
-async fn resolve_node_id(args: &Args) -> Result<String> {
-    if let Some(id) = &args.node_id {
-        return Ok(id.clone());
-    }
-    let path = args.data_dir.join("node_id");
-    if path.exists() {
-        let id = tokio::fs::read_to_string(&path).await?;
-        let id = id.trim().to_string();
-        if !id.is_empty() {
-            return Ok(id);
-        }
-    }
-    let id = format!("node-{}", Uuid::new_v4());
-    tokio::fs::write(&path, &id).await?;
-    Ok(id)
 }
 
 async fn on_server(
@@ -578,7 +623,8 @@ async fn flush_spool(spool: &RetrySpool, out: &SessionOut) -> Result<()> {
 
 #[cfg(test)]
 mod label_tests {
-    use super::parse_labels;
+    use super::{parse_labels, Args};
+    use clap::Parser;
 
     #[test]
     fn parses_pairs_and_ignores_junk() {
@@ -591,5 +637,22 @@ mod label_tests {
     #[test]
     fn empty_is_empty() {
         assert!(parse_labels("").is_empty());
+    }
+
+    #[test]
+    fn args_debug_redacts_bootstrap_token() {
+        let args = Args::try_parse_from([
+            "novbot-node",
+            "--center-grpc",
+            "http://127.0.0.1:50051",
+            "--node-id",
+            "n1",
+            "--bootstrap-token",
+            "tok-123",
+        ])
+        .unwrap();
+        let rendered = format!("{args:?}");
+        assert!(!rendered.contains("tok-123"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 }
