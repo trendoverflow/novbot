@@ -1,0 +1,12 @@
+{
+  "specs": [
+    {"id": "cpu", "kind": "cpu"},
+    {"id": "disk-root", "kind": "disk", "params": {"mount": "/"}},
+    {"id": "host-skill", "kind": "skill", "params": {"skill": "host_info"}},
+    {"id": "echo-skill", "kind": "skill", "params": {"skill": "echo", "arguments": {"text": "orb-demo"}}}
+  ],
+  "schedules": [
+    {"spec_id": "host-skill", "interval_secs": 60, "enabled": true},
+    {"spec_id": "cpu", "interval_secs": 60, "enabled": true}
+  ]
+}
