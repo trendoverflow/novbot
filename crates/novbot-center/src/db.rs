@@ -112,6 +112,25 @@ impl Db {
         Ok(())
     }
 
+    /// Insert an empty `nodes` row when `node_id` is unknown.
+    ///
+    /// `node_configs.node_id` references `nodes`. `INSERT IGNORE` creates that
+    /// parent row (hostname "", version "", labels `{}`, `last_seen_at` NULL)
+    /// and does not change hostname, version, labels, or `last_seen_at` when
+    /// the node has already registered.
+    pub async fn ensure_node_placeholder(&self, node_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT IGNORE INTO nodes (node_id, hostname, version, labels_json, last_seen_at)
+            VALUES (?, '', '', '{}', NULL)
+            "#,
+        )
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn touch_node(&self, node_id: &str) -> Result<()> {
         sqlx::query("UPDATE nodes SET last_seen_at = CURRENT_TIMESTAMP(3) WHERE node_id = ?")
             .bind(node_id)
@@ -402,4 +421,73 @@ fn split_sql(sql: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Connect and migrate for `#[cfg(test)]` MySQL tests.
+///
+/// Returns `None` (after a one-line skip notice) when `NOVBOT_TEST_DATABASE_URL`
+/// is unset or empty. Migration DDL is serialized: these tests run in parallel
+/// against one database, and concurrent `ALTER` deadlocks on MySQL.
+#[cfg(test)]
+pub(crate) async fn connect_test_db() -> Option<Db> {
+    let url = std::env::var("NOVBOT_TEST_DATABASE_URL").unwrap_or_default();
+    if url.trim().is_empty() {
+        eprintln!("skip: NOVBOT_TEST_DATABASE_URL is unset or empty");
+        return None;
+    }
+    static MIGRATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = MIGRATE.lock().await;
+    let db = Db::connect(url.trim())
+        .await
+        .expect("connect NOVBOT_TEST_DATABASE_URL");
+    db.migrate().await.expect("migrate");
+    Some(db)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    async fn fetch_node(db: &Db, id: &str) -> NodeRow {
+        db.list_nodes()
+            .await
+            .expect("list nodes")
+            .into_iter()
+            .find(|n| n.node_id == id)
+            .unwrap_or_else(|| panic!("missing node {id}"))
+    }
+
+    #[tokio::test]
+    async fn ensure_node_placeholder_is_noop_for_existing_node() {
+        let Some(db) = connect_test_db().await else {
+            return;
+        };
+        let id = format!("t16-{}", uuid::Uuid::new_v4());
+        let mut labels = HashMap::new();
+        labels.insert("env".to_string(), "prod".to_string());
+        labels.insert("role".to_string(), "api".to_string());
+        db.upsert_node(&id, "host-c", "0.2.0", &labels)
+            .await
+            .expect("upsert");
+
+        let before = fetch_node(&db, &id).await;
+        assert_eq!(before.hostname, "host-c");
+        assert_eq!(before.version, "0.2.0");
+        assert_eq!(
+            before.labels,
+            serde_json::json!({"env": "prod", "role": "api"})
+        );
+        assert!(before.last_seen_at.is_some());
+
+        // A timestamp write would move last_seen_at; INSERT IGNORE must not.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        db.ensure_node_placeholder(&id).await.expect("placeholder");
+
+        let after = fetch_node(&db, &id).await;
+        assert_eq!(after.hostname, before.hostname);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.labels, before.labels);
+        assert_eq!(after.last_seen_at, before.last_seen_at);
+    }
 }
