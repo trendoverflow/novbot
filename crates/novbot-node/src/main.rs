@@ -41,7 +41,7 @@ struct Args {
     #[arg(long)]
     center_grpc: Option<String>,
 
-    /// Stable node id (env: NOVBOT_NODE_ID).
+    /// Stable node id (env: NOVBOT_NODE_ID). If unset everywhere, loaded from or generated and persisted under --data-dir.
     #[arg(long)]
     node_id: Option<String>,
 
@@ -53,7 +53,7 @@ struct Args {
     #[arg(long, env = "NOVBOT_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Local data directory (retry spool + last_result.json). Not business config.
+    /// Local data directory (retry spool + last_result.json + node_id). Not business config.
     #[arg(long, env = "NOVBOT_DATA_DIR", default_value = "./data")]
     data_dir: PathBuf,
 
@@ -221,6 +221,7 @@ fn load_node_config(args: &Args) -> Result<config::NodeConfig, config::ConfigErr
         },
         |key| std::env::var(key).ok(),
         file,
+        &args.data_dir,
     )
 }
 

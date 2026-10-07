@@ -4,7 +4,8 @@
 //! Process configuration for the node daemon.
 //!
 //! `center_grpc`, `node_id`, and `bootstrap_token` resolve from the CLI flag,
-//! then the environment, then a TOML file. Any other file key is rejected.
+//! then the environment, then a TOML file. `node_id`, if still unset, is loaded
+//! from or generated under the data directory. Any other file key is rejected.
 //! Specs and schedules come from the center, not from this file.
 
 use serde::Deserialize;
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 use tonic::transport::Uri;
+use uuid::Uuid;
 
 const ENV_CENTER_GRPC: &str = "NOVBOT_CENTER_GRPC";
 const ENV_NODE_ID: &str = "NOVBOT_NODE_ID";
@@ -56,6 +58,8 @@ pub enum Source {
     Cli,
     Env,
     File,
+    DataDirPersisted,
+    DataDirGenerated,
 }
 
 impl std::fmt::Display for Source {
@@ -64,6 +68,8 @@ impl std::fmt::Display for Source {
             Source::Cli => "cli",
             Source::Env => "env",
             Source::File => "file",
+            Source::DataDirPersisted => "data_dir(persisted)",
+            Source::DataDirGenerated => "data_dir(generated)",
         })
     }
 }
@@ -133,34 +139,24 @@ pub enum ConfigError {
     InvalidCenterAddr { value: String, reason: String },
     #[error("config file {path}: {reason}")]
     ConfigFile { path: PathBuf, reason: String },
+    #[error("node ID unavailable at {path}: {reason}\n{}", node_id_examples())]
+    NodeIdUnavailable { path: PathBuf, reason: String },
 }
 
-struct Requirement {
-    what: &'static str,
-    flag: &'static str,
-    env: &'static str,
-}
-
-const CENTER_REQ: Requirement = Requirement {
-    what: "center gRPC address",
-    flag: "--center-grpc",
-    env: ENV_CENTER_GRPC,
-};
-
-const NODE_REQ: Requirement = Requirement {
-    what: "node ID",
-    flag: "--node-id",
-    env: ENV_NODE_ID,
-};
-
-/// Resolve `center_grpc` and `node_id` (required) and `bootstrap_token` (optional).
+/// Resolve `center_grpc` (required), `node_id`, and `bootstrap_token` (optional).
 ///
-/// Precedence per value is CLI, then `env`, then `file`. Whitespace-only values
-/// are treated as unset. `env` is a lookup such as `|key| std::env::var(key).ok()`.
+/// Precedence per value is CLI, then `env`, then `file`. When `node_id` is still
+/// unset, it is loaded from or generated under `data_dir` (see
+/// [`node_id_from_data_dir`]). Whitespace-only values are treated as unset.
+/// `env` is a lookup such as `|key| std::env::var(key).ok()`.
+///
+/// A missing or invalid center address is returned before the data directory
+/// is read or written.
 pub fn resolve(
     cli: CliValues,
     env: impl Fn(&str) -> Option<String>,
     file: Option<(PathBuf, FileConfig)>,
+    data_dir: &Path,
 ) -> Result<NodeConfig, ConfigError> {
     let (config_file, file_cfg) = match file {
         Some((path, cfg)) => (Some(path), Some(cfg)),
@@ -189,17 +185,11 @@ pub fn resolve(
             value: validate_center_addr(&value)?,
             source,
         },
-        None => {
-            let mut missing = vec![CENTER_REQ];
-            if node_raw.is_none() {
-                missing.push(NODE_REQ);
-            }
-            return Err(missing_error(&missing));
-        }
+        None => return Err(missing_center()),
     };
     let node_id = match node_raw {
         Some((value, source)) => Resolved { value, source },
-        None => return Err(missing_error(&[NODE_REQ])),
+        None => node_id_from_data_dir(data_dir)?,
     };
 
     Ok(NodeConfig {
@@ -208,6 +198,43 @@ pub fn resolve(
         bootstrap_token: token_raw.map(|(value, source)| Resolved { value, source }),
         config_file,
     })
+}
+
+/// Load `<data_dir>/node_id`, or generate `node-<uuid>` and persist it.
+///
+/// An existing non-empty file is trimmed and returned as
+/// [`Source::DataDirPersisted`]. A missing or whitespace-only file is replaced
+/// with a new id ([`Source::DataDirGenerated`]). The data directory is created
+/// only when a new id must be written. A read error on an existing file, or a
+/// failure to create the directory or write the file, is
+/// [`ConfigError::NodeIdUnavailable`].
+pub fn node_id_from_data_dir(data_dir: &Path) -> Result<Resolved<String>, ConfigError> {
+    let path = data_dir.join("node_id");
+    if path.exists() {
+        let text = std::fs::read_to_string(&path).map_err(|err| node_id_unavailable(&path, err))?;
+        let id = text.trim();
+        if !id.is_empty() {
+            return Ok(Resolved {
+                value: id.to_string(),
+                source: Source::DataDirPersisted,
+            });
+        }
+    }
+
+    std::fs::create_dir_all(data_dir).map_err(|err| node_id_unavailable(&path, err))?;
+    let id = format!("node-{}", Uuid::new_v4());
+    std::fs::write(&path, &id).map_err(|err| node_id_unavailable(&path, err))?;
+    Ok(Resolved {
+        value: id,
+        source: Source::DataDirGenerated,
+    })
+}
+
+fn node_id_unavailable(path: &Path, err: std::io::Error) -> ConfigError {
+    ConfigError::NodeIdUnavailable {
+        path: path.to_path_buf(),
+        reason: err.to_string(),
+    }
 }
 
 /// Parse TOML that may contain only `center_grpc`, `node_id`, and `bootstrap_token`.
@@ -365,47 +392,24 @@ fn nonempty(value: Option<String>) -> Option<String> {
     })
 }
 
-fn missing_error(items: &[Requirement]) -> ConfigError {
+fn missing_center() -> ConfigError {
     ConfigError::Missing {
-        what: items
-            .iter()
-            .map(|item| item.what)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        flag: items
-            .iter()
-            .map(|item| item.flag)
-            .collect::<Vec<_>>()
-            .join("\n"),
-        env: items
-            .iter()
-            .map(|item| item.env)
-            .collect::<Vec<_>>()
-            .join("\n"),
+        what: "center gRPC address".to_string(),
+        flag: "--center-grpc".to_string(),
+        env: ENV_CENTER_GRPC.to_string(),
     }
 }
 
 fn format_missing(what: &str, flag: &str, env: &str) -> String {
-    what.split('\n')
-        .zip(flag.split('\n'))
-        .zip(env.split('\n'))
-        .map(|((what, flag), env)| {
-            let example = if flag == "--node-id" {
-                NODE_EXAMPLE
-            } else {
-                CENTER_EXAMPLE
-            };
-            let key = if flag == "--node-id" {
-                "node_id"
-            } else {
-                "center_grpc"
-            };
-            format!(
-                "missing {what}: set one of\n  {flag} {example}\n  {env}={example}\n  {key} = \"{example}\"   (in the file passed via --config / NOVBOT_CONFIG)"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    format!(
+        "missing {what}: set one of\n  {flag} {CENTER_EXAMPLE}\n  {env}={CENTER_EXAMPLE}\n  center_grpc = \"{CENTER_EXAMPLE}\"   (in the file passed via --config / NOVBOT_CONFIG)"
+    )
+}
+
+fn node_id_examples() -> String {
+    format!(
+        "missing node ID: set one of\n  --node-id {NODE_EXAMPLE}\n  {ENV_NODE_ID}={NODE_EXAMPLE}\n  node_id = \"{NODE_EXAMPLE}\"   (in the file passed via --config / NOVBOT_CONFIG)"
+    )
 }
 
 /// `toml::de::Error`'s Display repeats the offending source line, which may
@@ -466,6 +470,30 @@ mod tests {
             node_id: Some(node.to_string()),
             bootstrap_token: Some(token.parse().unwrap()),
         }
+    }
+
+    /// Tests that already supply a node id never touch the data directory.
+    fn resolve(
+        cli: CliValues,
+        env: impl Fn(&str) -> Option<String>,
+        file: Option<(PathBuf, FileConfig)>,
+    ) -> Result<NodeConfig, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        super::resolve(cli, env, file, dir.path())
+    }
+
+    fn center_cli() -> CliValues {
+        CliValues {
+            center_grpc: Some("http://127.0.0.1:50051".into()),
+            ..CliValues::default()
+        }
+    }
+
+    fn assert_generated_id(id: &str) {
+        let uuid = id
+            .strip_prefix("node-")
+            .unwrap_or_else(|| panic!("expected node-<uuid>, got {id}"));
+        uuid::Uuid::parse_str(uuid).unwrap_or_else(|err| panic!("{id}: {err}"));
     }
 
     const FILE_TEXT: &str = "\
@@ -655,42 +683,190 @@ bootstrap_token = \" file-token \"
     }
 
     #[test]
-    fn missing_node_id_names_flag_env_and_toml() {
-        let err = resolve(
+    fn data_dir_source_display() {
+        assert_eq!(Source::DataDirPersisted.to_string(), "data_dir(persisted)");
+        assert_eq!(Source::DataDirGenerated.to_string(), "data_dir(generated)");
+    }
+
+    #[test]
+    fn persisted_node_id_is_loaded_and_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_id");
+        std::fs::write(&path, "  persisted-node \n").unwrap();
+
+        let cfg = super::resolve(center_cli(), env_of(&[]), None, dir.path()).unwrap();
+        assert_eq!(cfg.node_id.source, Source::DataDirPersisted);
+        assert_eq!(cfg.node_id.value, "persisted-node");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "  persisted-node \n"
+        );
+    }
+
+    #[test]
+    fn missing_node_id_is_generated_then_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_id");
+        let cfg = super::resolve(center_cli(), env_of(&[]), None, dir.path()).unwrap();
+        assert_eq!(cfg.node_id.source, Source::DataDirGenerated);
+        assert_generated_id(&cfg.node_id.value);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), cfg.node_id.value);
+
+        let again = super::resolve(center_cli(), env_of(&[]), None, dir.path()).unwrap();
+        assert_eq!(again.node_id.source, Source::DataDirPersisted);
+        assert_eq!(again.node_id.value, cfg.node_id.value);
+    }
+
+    #[test]
+    fn empty_or_whitespace_persisted_node_id_is_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_id");
+        for contents in ["", " \n\t "] {
+            std::fs::write(&path, contents).unwrap();
+            let cfg = super::resolve(center_cli(), env_of(&[]), None, dir.path()).unwrap();
+            assert_eq!(cfg.node_id.source, Source::DataDirGenerated, "{contents:?}");
+            assert_generated_id(&cfg.node_id.value);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), cfg.node_id.value);
+        }
+    }
+
+    #[test]
+    fn cli_env_and_file_win_over_persisted_node_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_id");
+        std::fs::write(&path, "persisted-node").unwrap();
+
+        let cfg = super::resolve(
+            CliValues::default(),
+            env_of(&[]),
+            file_pair("center_grpc = \"http://127.0.0.1:50051\"\nnode_id = \"file-node\"\n"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(cfg.node_id.source, Source::File);
+        assert_eq!(cfg.node_id.value, "file-node");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "persisted-node");
+
+        let cfg = super::resolve(
+            CliValues::default(),
+            env_of(&[
+                ("NOVBOT_CENTER_GRPC", "http://127.0.0.1:50051"),
+                ("NOVBOT_NODE_ID", "env-node"),
+            ]),
+            file_pair("center_grpc = \"http://file.example:50051\"\nnode_id = \"file-node\"\n"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(cfg.node_id.source, Source::Env);
+        assert_eq!(cfg.node_id.value, "env-node");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "persisted-node");
+
+        let cfg = super::resolve(
             CliValues {
                 center_grpc: Some("http://127.0.0.1:50051".into()),
-                ..CliValues::default()
+                node_id: Some("cli-node".into()),
+                bootstrap_token: None,
             },
-            env_of(&[]),
-            None,
+            env_of(&[("NOVBOT_NODE_ID", "env-node")]),
+            file_pair("center_grpc = \"http://file.example:50051\"\nnode_id = \"file-node\"\n"),
+            dir.path(),
         )
-        .unwrap_err();
-        assert!(matches!(
-            &err,
-            ConfigError::Missing { what, flag, env }
-                if what == "node ID" && flag == "--node-id" && env == "NOVBOT_NODE_ID"
-        ));
+        .unwrap();
+        assert_eq!(cfg.node_id.source, Source::Cli);
+        assert_eq!(cfg.node_id.value, "cli-node");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "persisted-node");
+    }
+
+    #[test]
+    fn unwritable_data_dir_reports_node_id_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("regular-file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let data_dir = blocker.join("data");
+
+        let err = super::resolve(center_cli(), env_of(&[]), None, &data_dir).unwrap_err();
+        let ConfigError::NodeIdUnavailable { path, reason } = &err else {
+            panic!("{err}");
+        };
         let msg = err.to_string();
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+        assert!(msg.contains(reason.as_str()), "{msg}");
+        assert!(msg.contains(&data_dir.display().to_string()), "{msg}");
         assert!(msg.contains("--node-id orb-arm-1"), "{msg}");
         assert!(msg.contains("NOVBOT_NODE_ID=orb-arm-1"), "{msg}");
         assert!(msg.contains("node_id = \"orb-arm-1\""), "{msg}");
     }
 
     #[test]
-    fn missing_center_and_node_id_are_one_error() {
-        let err = resolve(CliValues::default(), env_of(&[]), None).unwrap_err();
-        assert!(matches!(err, ConfigError::Missing { .. }));
+    fn unreadable_persisted_node_id_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_id");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = super::resolve(center_cli(), env_of(&[]), None, dir.path()).unwrap_err();
+        let ConfigError::NodeIdUnavailable {
+            path: err_path,
+            reason,
+        } = &err
+        else {
+            panic!("{err}");
+        };
         let msg = err.to_string();
-        assert!(msg.contains("--center-grpc"), "{msg}");
-        assert!(msg.contains("NOVBOT_CENTER_GRPC"), "{msg}");
+        assert_eq!(err_path, &path);
+        assert!(msg.contains(&path.display().to_string()), "{msg}");
+        assert!(msg.contains(reason.as_str()), "{msg}");
+        assert!(msg.contains("--node-id orb-arm-1"), "{msg}");
+        assert!(msg.contains("NOVBOT_NODE_ID=orb-arm-1"), "{msg}");
+        assert!(msg.contains("node_id = \"orb-arm-1\""), "{msg}");
+    }
+
+    #[test]
+    fn missing_center_does_not_create_node_id_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = super::resolve(CliValues::default(), env_of(&[]), None, dir.path()).unwrap_err();
+        assert!(matches!(
+            &err,
+            ConfigError::Missing { what, flag, env }
+                if what == "center gRPC address"
+                    && flag == "--center-grpc"
+                    && env == "NOVBOT_CENTER_GRPC"
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--center-grpc http://novbot-center:50051"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("NOVBOT_CENTER_GRPC=http://novbot-center:50051"),
+            "{msg}"
+        );
         assert!(
             msg.contains("center_grpc = \"http://novbot-center:50051\""),
             "{msg}"
         );
-        assert!(msg.contains("--node-id orb-arm-1"), "{msg}");
-        assert!(msg.contains("NOVBOT_NODE_ID=orb-arm-1"), "{msg}");
-        assert!(msg.contains("node_id = \"orb-arm-1\""), "{msg}");
-        assert_eq!(msg.matches("missing ").count(), 2, "{msg}");
+        assert!(!msg.contains("node_id"), "{msg}");
+        assert!(!msg.contains("--node-id"), "{msg}");
+        assert!(!dir.path().join("node_id").exists());
+    }
+
+    #[test]
+    fn invalid_center_does_not_create_node_id_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = super::resolve(
+            CliValues {
+                center_grpc: Some("http://host".into()),
+                ..CliValues::default()
+            },
+            env_of(&[]),
+            None,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidCenterAddr { .. }),
+            "{err}"
+        );
+        assert!(!dir.path().join("node_id").exists());
     }
 
     #[test]

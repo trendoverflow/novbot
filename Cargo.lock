@@ -1268,6 +1268,7 @@ dependencies = [
  "novbot-proto",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
