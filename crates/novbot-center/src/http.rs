@@ -354,8 +354,7 @@ async fn dispatch_to_node(
     run_id: Option<String>,
 ) -> Result<(String, &'static str), ApiError> {
     let run_id = run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let params_json =
-        serde_json::to_string(&params.unwrap_or(Value::Object(Default::default())))?;
+    let params_json = serde_json::to_string(&params.unwrap_or(Value::Object(Default::default())))?;
 
     let msg = ServerMessage {
         request_id: Uuid::new_v4().to_string(),

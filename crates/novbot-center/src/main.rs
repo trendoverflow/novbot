@@ -29,6 +29,11 @@ struct Args {
     #[arg(long, env = "NOVBOT_BOOTSTRAP_TOKEN")]
     bootstrap_token: Option<String>,
 
+    /// Seconds to wait for NodeReady after a session binds before flushing queued dispatches.
+    /// Nodes that never send NodeReady still drain when this elapses.
+    #[arg(long, env = "NOVBOT_NODE_READY_TIMEOUT_SECS", default_value_t = 120)]
+    node_ready_timeout_secs: u64,
+
     /// Stub license key (M7). When set, EE report paths open.
     #[arg(long, env = "NOVBOT_LICENSE_KEY")]
     license_key: Option<String>,
@@ -60,9 +65,10 @@ async fn main() -> anyhow::Result<()> {
     let api_token = args.api_token.clone();
     let grpc_addr = args.grpc_addr;
     let http_addr = args.http_addr;
+    let ready_timeout = std::time::Duration::from_secs(args.node_ready_timeout_secs);
 
     let grpc = tokio::spawn(async move {
-        if let Err(e) = grpc::serve(grpc_addr, db_grpc, hub_grpc, token).await {
+        if let Err(e) = grpc::serve(grpc_addr, db_grpc, hub_grpc, token, ready_timeout).await {
             tracing::error!(error = %e, "gRPC server exited");
         }
     });
