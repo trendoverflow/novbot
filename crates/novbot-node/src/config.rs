@@ -7,6 +7,9 @@
 //! then the environment, then a TOML file. `node_id`, if still unset, is loaded
 //! from or generated under the data directory. Any other file key is rejected.
 //! Specs and schedules come from the center, not from this file.
+//!
+//! `allow_exec` is node-local: `--allow-exec`, else `NOVBOT_ALLOW_EXEC`, else
+//! false. The config file and the center cannot enable it.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -18,6 +21,7 @@ use uuid::Uuid;
 const ENV_CENTER_GRPC: &str = "NOVBOT_CENTER_GRPC";
 const ENV_NODE_ID: &str = "NOVBOT_NODE_ID";
 const ENV_BOOTSTRAP_TOKEN: &str = "NOVBOT_BOOTSTRAP_TOKEN";
+const ENV_ALLOW_EXEC: &str = "NOVBOT_ALLOW_EXEC";
 const CENTER_EXAMPLE: &str = "http://novbot-center:50051";
 const NODE_EXAMPLE: &str = "orb-arm-1";
 
@@ -60,6 +64,7 @@ pub enum Source {
     File,
     DataDirPersisted,
     DataDirGenerated,
+    Default,
 }
 
 impl std::fmt::Display for Source {
@@ -70,6 +75,7 @@ impl std::fmt::Display for Source {
             Source::File => "file",
             Source::DataDirPersisted => "data_dir(persisted)",
             Source::DataDirGenerated => "data_dir(generated)",
+            Source::Default => "default",
         })
     }
 }
@@ -95,12 +101,15 @@ impl std::fmt::Display for CenterAddr {
     }
 }
 
-/// CLI inputs for the three file-overridable settings. Empty values are unset.
+/// CLI inputs. Empty strings are unset for the three file-overridable settings.
+/// `allow_exec` is the `--allow-exec` flag and is never read from the file.
 #[derive(Debug, Clone, Default)]
 pub struct CliValues {
     pub center_grpc: Option<String>,
     pub node_id: Option<String>,
     pub bootstrap_token: Option<Secret>,
+    /// True when `--allow-exec` was passed. Does not consult the environment.
+    pub allow_exec: bool,
 }
 
 /// TOML file. Only these keys are accepted.
@@ -122,6 +131,8 @@ pub struct NodeConfig {
     pub node_id: Resolved<String>,
     pub bootstrap_token: Option<Resolved<Secret>>,
     pub config_file: Option<PathBuf>,
+    /// Node-local exec gate. Never sourced from the config file or the center.
+    pub allow_exec: Resolved<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -139,8 +150,53 @@ pub enum ConfigError {
     InvalidCenterAddr { value: String, reason: String },
     #[error("config file {path}: {reason}")]
     ConfigFile { path: PathBuf, reason: String },
+    #[error(
+        "invalid NOVBOT_ALLOW_EXEC `{value}`: expected one of 1, true, yes, on, 0, false, no, off"
+    )]
+    InvalidAllowExec { value: String },
     #[error("node ID unavailable at {path}: {reason}\n{}", node_id_examples())]
     NodeIdUnavailable { path: PathBuf, reason: String },
+}
+
+/// Resolve whether the exec Spec kind may run a shell on this node.
+///
+/// Precedence is the CLI flag, then `NOVBOT_ALLOW_EXEC`, then false
+/// ([`Source::Default`]). A blank environment value is unset. Accepted
+/// values, compared case-insensitively, are `1`, `true`, `yes`, `on`, `0`,
+/// `false`, `no`, and `off`. The config file is not consulted.
+pub fn resolve_allow_exec(
+    cli_flag: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Resolved<bool>, ConfigError> {
+    if cli_flag {
+        return Ok(Resolved {
+            value: true,
+            source: Source::Cli,
+        });
+    }
+    if let Some(raw) = env(ENV_ALLOW_EXEC) {
+        let value = raw.trim();
+        if !value.is_empty() {
+            let folded = value.to_ascii_lowercase();
+            let enabled = match folded.as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => {
+                    return Err(ConfigError::InvalidAllowExec {
+                        value: value.to_string(),
+                    });
+                }
+            };
+            return Ok(Resolved {
+                value: enabled,
+                source: Source::Env,
+            });
+        }
+    }
+    Ok(Resolved {
+        value: false,
+        source: Source::Default,
+    })
 }
 
 /// Resolve `center_grpc` (required), `node_id`, and `bootstrap_token` (optional).
@@ -150,8 +206,13 @@ pub enum ConfigError {
 /// [`node_id_from_data_dir`]). Whitespace-only values are treated as unset.
 /// `env` is a lookup such as `|key| std::env::var(key).ok()`.
 ///
+/// `allow_exec` comes from [`resolve_allow_exec`] (CLI flag, then
+/// `NOVBOT_ALLOW_EXEC`, then false). It is not read from the file.
+///
 /// A missing or invalid center address is returned before the data directory
-/// is read or written.
+/// is read or written. An invalid `NOVBOT_ALLOW_EXEC` is reported after the
+/// center address is validated and before the data directory is touched, and
+/// is ignored when the CLI flag is set.
 pub fn resolve(
     cli: CliValues,
     env: impl Fn(&str) -> Option<String>,
@@ -187,6 +248,7 @@ pub fn resolve(
         },
         None => return Err(missing_center()),
     };
+    let allow_exec = resolve_allow_exec(cli.allow_exec, &env)?;
     let node_id = match node_raw {
         Some((value, source)) => Resolved { value, source },
         None => node_id_from_data_dir(data_dir)?,
@@ -197,6 +259,7 @@ pub fn resolve(
         node_id,
         bootstrap_token: token_raw.map(|(value, source)| Resolved { value, source }),
         config_file,
+        allow_exec,
     })
 }
 
@@ -469,6 +532,7 @@ mod tests {
             center_grpc: Some(center.to_string()),
             node_id: Some(node.to_string()),
             bootstrap_token: Some(token.parse().unwrap()),
+            allow_exec: false,
         }
     }
 
@@ -588,6 +652,7 @@ bootstrap_token = \"file-token\"
                 center_grpc: Some("http://cli.example:50051".into()),
                 node_id: None,
                 bootstrap_token: None,
+                allow_exec: false,
             },
             env_of(&[("NOVBOT_NODE_ID", "env-node")]),
             file_pair(FILE_TEXT),
@@ -606,6 +671,7 @@ bootstrap_token = \"file-token\"
                 center_grpc: Some("  ".into()),
                 node_id: Some("".into()),
                 bootstrap_token: Some("".parse().unwrap()),
+                allow_exec: false,
             },
             env_of(&[
                 ("NOVBOT_CENTER_GRPC", ""),
@@ -632,6 +698,7 @@ bootstrap_token = \" file-token \"
                 center_grpc: Some("".into()),
                 node_id: None,
                 bootstrap_token: Some("   ".parse().unwrap()),
+                allow_exec: false,
             },
             env_of(&[
                 ("NOVBOT_CENTER_GRPC", " http://env.example:50051 "),
@@ -686,6 +753,7 @@ bootstrap_token = \" file-token \"
     fn data_dir_source_display() {
         assert_eq!(Source::DataDirPersisted.to_string(), "data_dir(persisted)");
         assert_eq!(Source::DataDirGenerated.to_string(), "data_dir(generated)");
+        assert_eq!(Source::Default.to_string(), "default");
     }
 
     #[test]
@@ -766,6 +834,7 @@ bootstrap_token = \" file-token \"
                 center_grpc: Some("http://127.0.0.1:50051".into()),
                 node_id: Some("cli-node".into()),
                 bootstrap_token: None,
+                allow_exec: false,
             },
             env_of(&[("NOVBOT_NODE_ID", "env-node")]),
             file_pair("center_grpc = \"http://file.example:50051\"\nnode_id = \"file-node\"\n"),
@@ -974,6 +1043,7 @@ bootstrap_token = \" file-token \"
                 center_grpc: Some(bad.into()),
                 node_id: Some("n1".into()),
                 bootstrap_token: None,
+                allow_exec: false,
             },
             env_of(&[("NOVBOT_CENTER_GRPC", "http://127.0.0.1:50051")]),
             None,
@@ -1007,6 +1077,111 @@ bootstrap_token = \" file-token \"
         assert!(!cfg_dbg.contains(token), "{cfg_dbg}");
         assert!(cfg_dbg.contains("<redacted>"), "{cfg_dbg}");
         assert_eq!(cfg.bootstrap_token.unwrap().value.expose(), token);
+    }
+
+    #[test]
+    fn allow_exec_flag_enables_and_beats_env() {
+        let enabled = resolve_allow_exec(true, env_of(&[])).unwrap();
+        assert!(enabled.value);
+        assert_eq!(enabled.source, Source::Cli);
+
+        let beats = resolve_allow_exec(true, env_of(&[("NOVBOT_ALLOW_EXEC", "false")])).unwrap();
+        assert!(beats.value);
+        assert_eq!(beats.source, Source::Cli);
+    }
+
+    #[test]
+    fn allow_exec_env_parses_accepted_values() {
+        for value in ["true", "1", "YES", "on", "yes", "True"] {
+            let resolved =
+                resolve_allow_exec(false, env_of(&[("NOVBOT_ALLOW_EXEC", value)])).unwrap();
+            assert!(resolved.value, "{value}");
+            assert_eq!(resolved.source, Source::Env, "{value}");
+        }
+        for value in ["false", "0", "no", "off", "NO"] {
+            let resolved =
+                resolve_allow_exec(false, env_of(&[("NOVBOT_ALLOW_EXEC", value)])).unwrap();
+            assert!(!resolved.value, "{value}");
+            assert_eq!(resolved.source, Source::Env, "{value}");
+        }
+    }
+
+    #[test]
+    fn allow_exec_unset_or_blank_is_default_false() {
+        let unset = resolve_allow_exec(false, env_of(&[])).unwrap();
+        assert!(!unset.value);
+        assert_eq!(unset.source, Source::Default);
+        assert_eq!(unset.source.to_string(), "default");
+
+        for blank in ["", "   ", "\t"] {
+            let resolved =
+                resolve_allow_exec(false, env_of(&[("NOVBOT_ALLOW_EXEC", blank)])).unwrap();
+            assert!(!resolved.value, "{blank:?}");
+            assert_eq!(resolved.source, Source::Default, "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn allow_exec_invalid_env_errors() {
+        let err = resolve_allow_exec(false, env_of(&[("NOVBOT_ALLOW_EXEC", "maybe")])).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidAllowExec { ref value } if value == "maybe"));
+        let msg = err.to_string();
+        for token in ["1", "true", "yes", "on", "0", "false", "no", "off"] {
+            assert!(msg.contains(token), "{msg}");
+        }
+        assert!(msg.contains("maybe"), "{msg}");
+    }
+
+    #[test]
+    fn resolve_threads_allow_exec_flag_over_env() {
+        let cfg = resolve(
+            CliValues {
+                allow_exec: true,
+                ..center_cli()
+            },
+            env_of(&[("NOVBOT_ALLOW_EXEC", "false")]),
+            None,
+        )
+        .unwrap();
+        assert!(cfg.allow_exec.value);
+        assert_eq!(cfg.allow_exec.source, Source::Cli);
+
+        let cfg = resolve(center_cli(), env_of(&[("NOVBOT_ALLOW_EXEC", "on")]), None).unwrap();
+        assert!(cfg.allow_exec.value);
+        assert_eq!(cfg.allow_exec.source, Source::Env);
+    }
+
+    #[test]
+    fn invalid_allow_exec_does_not_create_node_id_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = super::resolve(
+            center_cli(),
+            env_of(&[("NOVBOT_ALLOW_EXEC", "maybe")]),
+            None,
+            dir.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidAllowExec { .. }), "{err}");
+        assert!(!dir.path().join("node_id").exists());
+    }
+
+    #[test]
+    fn file_allow_exec_is_rejected() {
+        let text = "allow_exec = true\n";
+        let err = parse_file_config(Path::new("node.toml"), text).unwrap_err();
+        assert!(matches!(err, ConfigError::ConfigFile { .. }), "{err}");
+        assert!(err.to_string().contains("allow_exec"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.toml");
+        std::fs::write(
+            &path,
+            "center_grpc = \"http://127.0.0.1:50051\"\nnode_id = \"n1\"\nallow_exec = true\n",
+        )
+        .unwrap();
+        let err = load_file_config(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::ConfigFile { .. }), "{err}");
+        assert!(err.to_string().contains("allow_exec"), "{err}");
     }
 
     #[test]

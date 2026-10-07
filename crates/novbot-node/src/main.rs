@@ -13,7 +13,7 @@ use config::Secret;
 use futures::StreamExt;
 use novbot_core::{
     due_specs, parse_schedules_json, parse_specs_json, run_probe, write_egress_result,
-    PendingReport, RetrySpool, Schedule, Spec,
+    PendingReport, ProbePolicy, RetrySpool, Schedule, Spec, SpecKind,
 };
 use novbot_proto::control_client::ControlClient;
 use novbot_proto::{
@@ -52,6 +52,10 @@ struct Args {
     /// TOML file with center_grpc, node_id, and bootstrap_token only (env: NOVBOT_CONFIG).
     #[arg(long, env = "NOVBOT_CONFIG")]
     config: Option<PathBuf>,
+
+    /// Allow exec Specs to run shell commands as this user (env: NOVBOT_ALLOW_EXEC). Off by default; not a config-file key.
+    #[arg(long)]
+    allow_exec: bool,
 
     /// Local data directory (retry spool + last_result.json + node_id). Not business config.
     #[arg(long, env = "NOVBOT_DATA_DIR", default_value = "./data")]
@@ -115,6 +119,22 @@ async fn main() -> Result<()> {
         config_file = %config_file,
         "starting novbot-node"
     );
+    if cfg.allow_exec.value {
+        tracing::warn!(
+            allow_exec = true,
+            allow_exec_source = %cfg.allow_exec.source,
+            "exec Spec kind ENABLED: center can run shell commands on this node as the service user"
+        );
+    } else {
+        tracing::warn!(
+            allow_exec = false,
+            allow_exec_source = %cfg.allow_exec.source,
+            "exec Spec kind disabled; exec runs will report failed/exec_disabled (enable node-locally with --allow-exec or NOVBOT_ALLOW_EXEC=true)"
+        );
+    }
+    let policy = ProbePolicy {
+        allow_exec: cfg.allow_exec.value,
+    };
     resolve_center_dns(&cfg.center_grpc.value).await;
 
     tokio::fs::create_dir_all(&args.data_dir).await?;
@@ -164,7 +184,9 @@ async fn main() -> Result<()> {
             let mut ticker = tokio::time::interval(every);
             loop {
                 ticker.tick().await;
-                if let Err(e) = run_due(&node_id, &state, &spool, &data_dir, &out, None).await {
+                if let Err(e) =
+                    run_due(&node_id, &state, &spool, &data_dir, &out, None, policy).await
+                {
                     tracing::warn!(error = %e, "scheduler tick failed");
                 }
             }
@@ -188,7 +210,7 @@ async fn main() -> Result<()> {
 
     let mut backoff = RECONNECT_MIN;
     loop {
-        match run_session(&args, &cfg, &hostname, &state, &spool, &session_out).await {
+        match run_session(&args, &cfg, &hostname, &state, &spool, &session_out, policy).await {
             Ok(()) => {
                 tracing::warn!("control stream closed; will reconnect");
                 backoff = RECONNECT_MIN;
@@ -218,6 +240,7 @@ fn load_node_config(args: &Args) -> Result<config::NodeConfig, config::ConfigErr
             center_grpc: args.center_grpc.clone(),
             node_id: args.node_id.clone(),
             bootstrap_token: args.bootstrap_token.clone(),
+            allow_exec: args.allow_exec,
         },
         |key| std::env::var(key).ok(),
         file,
@@ -244,6 +267,7 @@ async fn run_session(
     state: &Arc<RwLock<RuntimeState>>,
     spool: &Arc<RetrySpool>,
     session_out: &SessionOut,
+    policy: ProbePolicy,
 ) -> Result<()> {
     let center = cfg.center_grpc.value.uri.clone();
     let node_id = cfg.node_id.value.as_str();
@@ -304,7 +328,17 @@ async fn run_session(
                 break;
             }
         };
-        if let Err(e) = on_server(node_id, state, spool, &args.data_dir, session_out, msg).await {
+        if let Err(e) = on_server(
+            node_id,
+            state,
+            spool,
+            &args.data_dir,
+            session_out,
+            policy,
+            msg,
+        )
+        .await
+        {
             tracing::warn!(error = %e, "handle server message failed");
         }
     }
@@ -355,6 +389,7 @@ async fn on_server(
     spool: &Arc<RetrySpool>,
     data_dir: &PathBuf,
     out: &SessionOut,
+    policy: ProbePolicy,
     msg: ServerMessage,
 ) -> Result<()> {
     let Some(body) = msg.body else {
@@ -390,6 +425,7 @@ async fn on_server(
                 resp.config_generation,
                 &resp.specs_json,
                 &resp.schedules_json,
+                policy,
             )
             .await?;
         }
@@ -403,6 +439,7 @@ async fn on_server(
                 push.config_generation,
                 &push.specs_json,
                 &schedules_json,
+                policy,
             )
             .await?;
         }
@@ -413,7 +450,7 @@ async fn on_server(
             tracing::info!(generation = push.config_generation, "schedules pushed");
         }
         server_message::Body::Dispatch(d) => {
-            run_dispatch(node_id, state, spool, data_dir, out, &d).await?;
+            run_dispatch(node_id, state, spool, data_dir, out, &d, policy).await?;
         }
         server_message::Body::ReportResult(_)
         | server_message::Body::Ack(_)
@@ -427,9 +464,24 @@ async fn apply_config(
     generation: i64,
     specs_json: &str,
     schedules_json: &str,
+    policy: ProbePolicy,
 ) -> Result<()> {
     let specs = parse_specs_json(specs_json)?;
     let schedules = parse_schedules_json(schedules_json)?;
+    if !policy.allow_exec {
+        let exec_ids: Vec<&str> = specs
+            .iter()
+            .filter(|spec| spec.kind == SpecKind::Exec)
+            .map(|spec| spec.id.as_str())
+            .collect();
+        if !exec_ids.is_empty() {
+            tracing::warn!(
+                count = exec_ids.len(),
+                spec_ids = ?exec_ids,
+                "config contains exec Specs but exec is disabled on this node; they will report failed/exec_disabled"
+            );
+        }
+    }
     let mut st = state.write().await;
     st.specs = specs.into_iter().map(|s| (s.id.clone(), s)).collect();
     st.schedules = schedules;
@@ -450,6 +502,7 @@ async fn run_due(
     data_dir: &PathBuf,
     out: &SessionOut,
     only_spec: Option<&str>,
+    policy: ProbePolicy,
 ) -> Result<()> {
     let specs: Vec<Spec> = {
         let mut st = state.write().await;
@@ -476,7 +529,7 @@ async fn run_due(
     for spec in specs {
         let run_id = Uuid::new_v4().to_string();
         let observed_at = Utc::now().timestamp_millis();
-        let (status, payload) = match run_probe(&spec).await {
+        let (status, payload) = match run_probe(&spec, &policy).await {
             Ok(out) => (out.status.to_string(), out.payload),
             Err(e) => ("error".to_string(), json!({"error": e.to_string()})),
         };
@@ -525,6 +578,7 @@ async fn run_dispatch(
     data_dir: &PathBuf,
     out: &SessionOut,
     d: &Dispatch,
+    policy: ProbePolicy,
 ) -> Result<()> {
     let mut spec = {
         let st = state.read().await;
@@ -553,7 +607,7 @@ async fn run_dispatch(
         d.run_id.clone()
     };
     let observed_at = Utc::now().timestamp_millis();
-    let (status, payload) = match run_probe(&spec).await {
+    let (status, payload) = match run_probe(&spec, &policy).await {
         Ok(out) => (out.status.to_string(), out.payload),
         Err(e) => ("error".to_string(), json!({"error": e.to_string()})),
     };
@@ -655,5 +709,131 @@ mod label_tests {
         let rendered = format!("{args:?}");
         assert!(!rendered.contains("tok-123"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod exec_gate_tests {
+    use super::{apply_config, run_dispatch, run_due, Args, RuntimeState, SessionOut};
+    use clap::Parser;
+    use novbot_core::{ProbePolicy, RetrySpool};
+    use novbot_proto::Dispatch;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn clap_allow_exec_flag() {
+        let enabled = Args::try_parse_from(["novbot-node", "--allow-exec"]).unwrap();
+        assert!(enabled.allow_exec);
+
+        let disabled = Args::try_parse_from(["novbot-node"]).unwrap();
+        assert!(!disabled.allow_exec);
+    }
+
+    fn touch_spec(spec_id: &str, marker: &std::path::Path) -> String {
+        serde_json::json!([{
+            "id": spec_id,
+            "kind": "exec",
+            "params": {
+                "command": format!("touch {}", marker.display()),
+                "allow_exec": true
+            }
+        }])
+        .to_string()
+    }
+
+    fn assert_exec_disabled(payload_json: &str, marker: &std::path::Path) {
+        let payload: serde_json::Value = serde_json::from_str(payload_json).unwrap();
+        assert_eq!(payload["reason"], "exec_disabled");
+        assert!(!payload_json.contains("touch"));
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn center_config_cannot_enable_exec() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("marker");
+        let data = tempfile::tempdir().unwrap();
+        let data_dir = data.path().to_path_buf();
+        let spool = Arc::new(RetrySpool::new(&data_dir));
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let spec_id = "exec-touch";
+        let schedules_json = serde_json::json!([{
+            "spec_id": spec_id,
+            "interval_secs": 1
+        }])
+        .to_string();
+
+        apply_config(
+            &state,
+            1,
+            &touch_spec(spec_id, &marker),
+            &schedules_json,
+            ProbePolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        let out: SessionOut = Arc::new(RwLock::new(None));
+        let result = run_due(
+            "node-1",
+            &state,
+            &spool,
+            &data_dir,
+            &out,
+            None,
+            ProbePolicy::default(),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let items = spool.drain().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "failed");
+        assert_exec_disabled(&items[0].payload_json, &marker);
+    }
+
+    #[tokio::test]
+    async fn dispatch_overlay_cannot_enable_exec() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("marker");
+        let data = tempfile::tempdir().unwrap();
+        let data_dir = data.path().to_path_buf();
+        let spool = Arc::new(RetrySpool::new(&data_dir));
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let spec_id = "exec-touch";
+
+        apply_config(
+            &state,
+            1,
+            &touch_spec(spec_id, &marker),
+            "[]",
+            ProbePolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        let out: SessionOut = Arc::new(RwLock::new(None));
+        let dispatch = Dispatch {
+            run_id: "run-1".into(),
+            spec_id: spec_id.into(),
+            params_json: r#"{"allow_exec":true}"#.into(),
+        };
+        let result = run_dispatch(
+            "node-1",
+            &state,
+            &spool,
+            &data_dir,
+            &out,
+            &dispatch,
+            ProbePolicy::default(),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let items = spool.drain().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "failed");
+        assert_exec_disabled(&items[0].payload_json, &marker);
     }
 }
