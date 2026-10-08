@@ -27,6 +27,7 @@ use novbot_proto::{
     PullConfigRequest, PullSkillsRequest, RegisterRequest, ReportResultRequest, ServerMessage,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read, Write};
@@ -46,11 +47,15 @@ const ARM3: &str = "orb-arm-3";
 const SKILL: &str = "os-release-check";
 const SPEC_ID: &str = "os-release";
 
+/// Isolates `role=db` from leftover nodes in the shared test database.
+static SUITE_MARK: Mutex<String> = Mutex::new(String::new());
+
 #[tokio::test]
 async fn three_node_lifecycle_covers_install_through_reboot() {
     let Some(db) = db::connect_test_db().await else {
         return;
     };
+    *SUITE_MARK.lock().expect("suite mark") = uuid::Uuid::new_v4().simple().to_string();
     let release = prepare_os_release();
     let _clear_fixture = ClearOsReleaseFixture;
 
@@ -82,7 +87,11 @@ async fn three_node_lifecycle_covers_install_through_reboot() {
         license_env: None,
     });
 
-    let v1 = upload(&app, fixture("os-release-check-1.0.0.nbskill")).await;
+    // The committed 1.0.0 fixture is the D10.7 tamper package. Its guest is not
+    // the example, so a run returns `unknown op`. D10.5 has to execute 1.0.0.
+    let v1_bytes = hub_pack::os_release_package();
+    replace_version_if_different(&db, SKILL, "1.0.0", &v1_bytes).await;
+    let v1 = upload(&app, v1_bytes).await;
     assert_eq!(v1["name"], SKILL);
     assert_eq!(v1["version"], "1.0.0");
     let sha_v1 = v1["sha256"].as_str().unwrap().trim().to_string();
@@ -119,7 +128,7 @@ async fn three_node_lifecycle_covers_install_through_reboot() {
         &json!({
             "version": "1.0.0",
             "node_ids": [ARM1],
-            "selector": {"labels": {"role": "db"}},
+            "selector": {"labels": {"role": "db", "suite": suite_mark()}},
             "accepted_capabilities_sha256": cap_v1,
         }),
     )
@@ -178,7 +187,7 @@ async fn three_node_lifecycle_covers_install_through_reboot() {
         &json!({
             "version": "1.0.0",
             "node_ids": [ARM1],
-            "selector": {"labels": {"role": "db"}},
+            "selector": {"labels": {"role": "db", "suite": suite_mark()}},
             "accepted_capabilities_sha256": wrong_hash,
         }),
     )
@@ -688,6 +697,12 @@ async fn three_node_lifecycle_covers_install_through_reboot() {
     assert!(hub.is_connected(ARM1));
     assert!(hub.is_connected(ARM2));
     assert!(hub.is_connected(ARM3));
+
+    // Put the D10.7 fixture back so a later run of that test is not version_exists.
+    let fixture_v1 = fixture("os-release-check-1.0.0.nbskill");
+    replace_version_if_different(&db, SKILL, "1.0.0", &fixture_v1).await;
+    let restored = upload(&app, fixture_v1).await;
+    assert_eq!(restored["version"], "1.0.0");
 }
 
 struct ReleaseFile {
@@ -1095,6 +1110,10 @@ async fn assert_converged(db: &Db, node: &Node) {
     assert_eq!(snap.applied_generation, generation_of(db, node.id).await);
 }
 
+fn suite_mark() -> String {
+    SUITE_MARK.lock().expect("suite mark").clone()
+}
+
 fn labels_for(role: &str) -> HashMap<String, String> {
     let platform = novbot_node::skills::current_platform();
     let (os, arch) = platform.split_once('/').expect("os/arch platform");
@@ -1102,6 +1121,7 @@ fn labels_for(role: &str) -> HashMap<String, String> {
         ("role".to_string(), role.to_string()),
         ("os".to_string(), os.to_string()),
         ("arch".to_string(), arch.to_string()),
+        ("suite".to_string(), suite_mark()),
     ])
 }
 
@@ -1137,6 +1157,71 @@ fn fast_limits() -> InstallLimits {
         ready_bound: Duration::from_millis(20),
         sleeper: Arc::new(|_| Box::pin(async {})),
     }
+}
+
+async fn replace_version_if_different(db: &Db, name: &str, version: &str, bytes: &[u8]) {
+    let sha = hex_sha256(bytes);
+    let existing: Option<String> = sqlx::query(
+        r#"
+        SELECT v.sha256
+        FROM skill_versions v
+        INNER JOIN skills s ON s.id = v.skill_id
+        WHERE s.name = ? AND v.version = ?
+        "#,
+    )
+    .bind(name)
+    .bind(version)
+    .fetch_optional(db.pool())
+    .await
+    .expect("lookup skill version")
+    .map(|row| row.try_get::<String, _>("sha256").expect("sha256"));
+    let Some(existing) = existing else {
+        return;
+    };
+    if existing.eq_ignore_ascii_case(&sha) {
+        return;
+    }
+    sqlx::query("DELETE FROM node_skills_desired WHERE skill_name = ? AND version = ?")
+        .bind(name)
+        .bind(version)
+        .execute(db.pool())
+        .await
+        .expect("clear desired version");
+    sqlx::query("DELETE FROM node_skills_actual WHERE skill_name = ? AND version = ?")
+        .bind(name)
+        .bind(version)
+        .execute(db.pool())
+        .await
+        .expect("clear actual version");
+    sqlx::query(
+        r#"
+        DELETE v FROM skill_versions v
+        INNER JOIN skills s ON s.id = v.skill_id
+        WHERE s.name = ? AND v.version = ?
+        "#,
+    )
+    .bind(name)
+    .bind(version)
+    .execute(db.pool())
+    .await
+    .expect("delete conflicting version");
+    sqlx::query(
+        r#"
+        DELETE FROM skill_artifacts
+        WHERE sha256 = ?
+          AND NOT EXISTS (SELECT 1 FROM skill_versions WHERE sha256 = ?)
+        "#,
+    )
+    .bind(&existing)
+    .bind(&existing)
+    .execute(db.pool())
+    .await
+    .expect("delete unused artifact");
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn fixture(name: &str) -> Vec<u8> {
