@@ -23,7 +23,8 @@ use novbot_proto::{
 };
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -63,10 +64,16 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
         license_env: None,
     });
 
-    let os_bytes = hub_pack::os_release_package();
+    // d10_7 already stores the committed os-release-check 1.0.0 fixture.
+    // A fresh pack of the example is different bytes, and the catalog rejects
+    // that pair with version_exists. The guest and grants stay as packed.
+    let os_skill = format!("os-release-{}", uuid::Uuid::new_v4().simple());
+    let os_bytes = rename_skill_package(&hub_pack::os_release_package(), &os_skill);
     let cap_bytes = hub_pack::cap_violation_package();
     let policy_bytes = hub_pack::cap_policy_package();
     let posted_os = upload(&app, os_bytes).await;
+    assert_eq!(posted_os["name"], os_skill);
+    assert_eq!(posted_os["version"], "1.0.0");
     let posted_cap = upload(&app, cap_bytes).await;
     let posted_policy = upload(&app, policy_bytes).await;
 
@@ -98,12 +105,16 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
     })
     .await
     .expect("pull config");
-    let _ = recv(&mut inbound).await;
+    let pulled = recv(&mut inbound).await;
+    let config_generation = match pulled.body {
+        Some(server_message::Body::PullConfig(resp)) => resp.config_generation,
+        other => panic!("expected PullConfig, got {other:?}"),
+    };
     tx.send(ClientMessage {
         request_id: "ready".into(),
         body: Some(client_message::Body::NodeReady(NodeReady {
             node_id: node_id.clone(),
-            config_generation: 0,
+            config_generation,
             skill_set_generation: 0,
         })),
     })
@@ -113,7 +124,7 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
     assert!(hub.is_connected(&node_id));
 
     let specs = json!([
-        {"id": "os-release", "kind": "skill", "params": {"skill": "os-release-check", "version": "^1.0"}},
+        {"id": "os-release", "kind": "skill", "params": {"skill": &os_skill, "version": "^1.0"}},
         {"id": "cap-violation", "kind": "skill", "params": {"skill": "cap-violation-test", "version": "=1.0.0"}},
         {"id": "cap-policy", "kind": "skill", "params": {"skill": "cap-violation-policy", "version": "=1.0.0"}}
     ]);
@@ -133,7 +144,7 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
         String::from_utf8_lossy(&bytes)
     );
 
-    install(&app, "os-release-check", "1.0.0", &posted_os, &node_id).await;
+    install(&app, &os_skill, "1.0.0", &posted_os, &node_id).await;
     install(&app, "cap-violation-test", "1.0.0", &posted_cap, &node_id).await;
     install(
         &app,
@@ -146,7 +157,7 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
     let desired = recv_desired_with(
         &mut inbound,
         &[
-            "os-release-check",
+            os_skill.as_str(),
             "cap-violation-test",
             "cap-violation-policy",
         ],
@@ -165,10 +176,7 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
     for skill in &snap.skills {
         assert_eq!(skill.state, "installed", "{snap:?}");
     }
-    assert_eq!(
-        host.active_version("os-release-check").as_deref(),
-        Some("1.0.0")
-    );
+    assert_eq!(host.active_version(&os_skill).as_deref(), Some("1.0.0"));
     assert_eq!(host.wasm_run_entries(), 0, "install must not execute");
 
     let want_id = hub_pack::os_field(&release.text, "ID");
@@ -182,9 +190,11 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
         &node_id,
         "os-release",
         None,
+        &os_skill,
     )
     .await;
     assert_eq!(os.0, "ok", "{os:?}");
+    assert_eq!(os.1["skill"]["name"], os_skill);
     assert_eq!(os.1["skill"]["version"], "1.0.0");
     assert_eq!(os.1["ID"], want_id);
     assert_eq!(os.1["VERSION_ID"], want_version);
@@ -228,6 +238,7 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
         &node_id,
         "cap-violation",
         None,
+        &os_skill,
     )
     .await;
     assert_denial(&shadow, "fs.read", "out_of_scope");
@@ -242,6 +253,7 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
         &node_id,
         "cap-violation",
         Some(json!({"arguments": {"mode": "undeclared"}})),
+        &os_skill,
     )
     .await;
     assert_denial(
@@ -259,6 +271,7 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
         &node_id,
         "cap-policy",
         None,
+        &os_skill,
     )
     .await;
     assert_denial(&policy, "fs.read", "policy_denied");
@@ -285,6 +298,7 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
         &node_id,
         "os-release",
         None,
+        &os_skill,
     )
     .await;
     assert_eq!(again.0, "ok", "{again:?}");
@@ -298,6 +312,7 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
         .find(|row| row["run_id"] == os.2 && row["spec_id"] == "os-release")
         .expect("stored os-release result");
     assert_eq!(os_row["status"], "ok");
+    assert_eq!(os_row["payload"]["skill"]["name"], os_skill);
     assert_eq!(os_row["payload"]["skill"]["version"], "1.0.0");
     assert_eq!(os_row["payload"]["ID"], want_id);
 
@@ -343,6 +358,7 @@ async fn dispatch_run(
     node_id: &str,
     spec_id: &str,
     params: Option<Value>,
+    os_skill: &str,
 ) -> (String, Value, String) {
     let body = json!({"spec_id": spec_id, "params": params.unwrap_or_else(|| json!({}))});
     let (status, bytes) = oneshot(
@@ -360,7 +376,7 @@ async fn dispatch_run(
     assert_eq!(accepted["delivered"], "live", "{accepted}");
     let run_id = accepted["run_id"].as_str().unwrap().to_string();
     let dispatch = recv_dispatch(inbound, spec_id, &run_id).await;
-    let mut spec = spec_by_id(spec_id);
+    let mut spec = spec_by_id(spec_id, os_skill);
     apply_dispatch_overlay(&mut spec, &dispatch.params_json);
     let (status, payload) = execute_spec(&spec, &ProbePolicy::default(), host, data, &run_id).await;
     let payload_json = serde_json::to_string(&payload).unwrap();
@@ -377,9 +393,9 @@ impl Drop for ClearOsReleaseFixture {
     }
 }
 
-fn spec_by_id(id: &str) -> Spec {
+fn spec_by_id(id: &str, os_skill: &str) -> Spec {
     let (skill, version) = match id {
-        "os-release" => ("os-release-check", "^1.0"),
+        "os-release" => (os_skill, "^1.0"),
         "cap-violation" => ("cap-violation-test", "=1.0.0"),
         "cap-policy" => ("cap-violation-policy", "=1.0.0"),
         other => panic!("unknown spec {other}"),
@@ -616,4 +632,156 @@ async fn recv_desired_with(
             }
         }
     }
+}
+
+/// Replace the packed skill name. `module.wasm` and every other entry stay.
+fn rename_skill_package(bytes: &[u8], name: &str) -> Vec<u8> {
+    let mut files = unpack_nbskill(bytes);
+    let wasm = files.get("module.wasm").cloned().expect("module.wasm");
+    let toml = std::str::from_utf8(files.get("skill.toml").expect("skill.toml"))
+        .expect("skill.toml utf-8");
+    let rewritten = rewrite_skill_name(toml, "os-release-check", name);
+    assert!(
+        rewritten.contains("version = \"1.0.0\""),
+        "renamed manifest dropped version 1.0.0"
+    );
+    files.insert("skill.toml".into(), rewritten.into_bytes());
+    let packed = pack_nbskill(&files);
+    let check = unpack_nbskill(&packed);
+    assert_eq!(
+        check.get("module.wasm").map(Vec::as_slice),
+        Some(wasm.as_slice()),
+        "rename changed module.wasm"
+    );
+    packed
+}
+
+fn rewrite_skill_name(toml: &str, from: &str, to: &str) -> String {
+    let needle = format!("name = \"{from}\"");
+    let replacement = format!("name = \"{to}\"");
+    let mut replaced = false;
+    let mut out = String::with_capacity(toml.len() + to.len());
+    for line in toml.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\n', '\r']).trim();
+        if !replaced && bare == needle {
+            out.push_str(&replacement);
+            if line.ends_with('\n') {
+                out.push('\n');
+            }
+            replaced = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    assert!(replaced, "package skill.toml has no name {from}");
+    out
+}
+
+fn unpack_nbskill(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(Cursor::new(bytes)));
+    let mut files = BTreeMap::new();
+    for entry in archive.entries().expect("archive") {
+        let mut entry = entry.expect("archive entry");
+        if entry.header().entry_type().is_dir() {
+            continue;
+        }
+        let raw = entry.path().expect("archive path");
+        let path = raw.to_string_lossy();
+        let path = path.trim_end_matches('/');
+        let path = path.strip_prefix("./").unwrap_or(path).to_string();
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).expect("read archive entry");
+        files.insert(path, data);
+    }
+    files
+}
+
+fn pack_nbskill(files: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
+    let mut entries: Vec<(&str, Option<&[u8]>)> = Vec::new();
+    if files.keys().any(|path| path.starts_with("schema/")) {
+        entries.push(("schema", None));
+    }
+    for (path, data) in files {
+        entries.push((path.as_str(), Some(data.as_slice())));
+    }
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        for (path, data) in &entries {
+            let mut header = tar::Header::new_gnu();
+            match data {
+                None => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_mode(0o755);
+                    header.set_size(0);
+                }
+                Some(data) => {
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_mode(0o644);
+                    header.set_size(data.len() as u64);
+                }
+            }
+            header.set_mtime(0);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            let body: &[u8] = data.unwrap_or(&[]);
+            builder
+                .append_data(&mut header, path, body)
+                .expect("tar entry");
+        }
+        builder.finish().expect("tar finish");
+    }
+    let mut encoder = flate2::GzBuilder::new()
+        .mtime(0)
+        .write(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar_bytes).expect("gzip");
+    encoder.finish().expect("gzip finish")
+}
+
+#[test]
+fn rename_skill_package_keeps_wasm_version_and_grants() {
+    let wasm = b"\0asm\x01\x00\x00\x00".to_vec();
+    let params = br#"{"type":"object"}"#.to_vec();
+    let toml = "\
+schema_version = 1
+name = \"os-release-check\"
+version = \"1.0.0\"
+
+[runtime]
+kind = \"wasm\"
+abi = \"novbot:skill@1\"
+
+[files]
+\"module.wasm\" = \"abc\"
+\"schema/params.json\" = \"def\"
+
+[[capabilities]]
+name = \"fs.read\"
+scope = \"/etc/os-release\"
+
+[[capabilities]]
+name = \"sys.info.read\"
+";
+    let mut files = BTreeMap::new();
+    files.insert("skill.toml".into(), toml.as_bytes().to_vec());
+    files.insert("module.wasm".into(), wasm.clone());
+    files.insert("schema/params.json".into(), params.clone());
+    let renamed = rename_skill_package(&pack_nbskill(&files), "os-release-abc123");
+    let out = unpack_nbskill(&renamed);
+    assert_eq!(out.get("module.wasm"), Some(&wasm));
+    assert_eq!(out.get("schema/params.json"), Some(&params));
+    let text = std::str::from_utf8(out.get("skill.toml").expect("skill.toml")).unwrap();
+    assert!(text
+        .lines()
+        .any(|line| line.trim() == "name = \"os-release-abc123\""));
+    assert!(text.contains("version = \"1.0.0\""));
+    assert!(text.contains("name = \"fs.read\""));
+    assert!(text.contains("scope = \"/etc/os-release\""));
+    assert!(text.contains("name = \"sys.info.read\""));
+    assert!(!text
+        .lines()
+        .any(|line| line.trim() == "name = \"os-release-check\""));
 }
