@@ -1,10 +1,12 @@
 // Copyright 2026 TrendOverflow / NovHub
 // SPDX-License-Identifier: Apache-2.0
 
+mod artifact;
 mod db;
 mod grpc;
 mod http;
 mod hub;
+mod skill_catalog;
 
 use anyhow::Context;
 use clap::Parser;
@@ -54,6 +56,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("database")?;
     db.migrate().await.context("migrate")?;
+    db.check_max_allowed_packet()
+        .await
+        .context("max_allowed_packet")?;
 
     let hub = Hub::new();
     let db_grpc = db.clone();
