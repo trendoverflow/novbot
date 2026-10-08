@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "permit_root_login": { "type": "string" },
+    "password_authentication": { "type": "string" }
+  },
+  "additionalProperties": false
+}

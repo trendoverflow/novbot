@@ -6,6 +6,8 @@ members = [
     "crates/novbot-center",
     "crates/novbot-node",
     "crates/novbot-skill-runtime",
+    "crates/novbot-skill-sdk",
+    "crates/novbot-skill",
 ]
 
 [workspace.package]

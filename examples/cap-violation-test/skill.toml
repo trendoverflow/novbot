@@ -1,0 +1,20 @@
+schema_version = 1
+name = "cap-violation-test"
+version = "1.0.0"
+display_name = "Capability violation test"
+description = "Read outside the fs.read grant, or call listening-ports without declaring it"
+
+[runtime]
+kind = "wasm"
+abi = "novbot:skill@1"
+
+[runtime.limits]
+timeout_ms = 10000
+memory_mb = 32
+
+[files]
+
+[[capabilities]]
+name = "fs.read"
+scope = "/etc/os-release"
+reason = "In-scope path. The shadow read and the undeclared port call are refused by the host"

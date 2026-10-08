@@ -1,0 +1,12 @@
+[package]
+name = "novbot-skill-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Guest SDK for NovBot skill components"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+wit-bindgen = "0.62"

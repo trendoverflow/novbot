@@ -1,0 +1,25 @@
+[package]
+name = "novbot-skill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI for NovBot skill packages"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+flate2 = { workspace = true }
+novbot-node = { path = "../novbot-node" }
+novbot-skill-runtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+ureq = "2.12"
+wasmtime = { workspace = true }
+
+[dev-dependencies]
+novbot-node = { path = "../novbot-node" }
+tempfile = { workspace = true }
