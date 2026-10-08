@@ -13,10 +13,11 @@ use clap::Parser;
 use config::Secret;
 use futures::StreamExt;
 use novbot_core::{
-    due_specs, parse_schedules_json, parse_specs_json, run_probe, write_egress_result,
-    PendingReport, ProbePolicy, RetrySpool, Schedule, Spec, SpecKind,
+    due_specs, parse_schedules_json, parse_specs_json, write_egress_result, PendingReport,
+    ProbePolicy, RetrySpool, Schedule, Spec, SpecKind,
 };
 use novbot_node::skills::{DesiredSet, GrpcArtifactSource, InstallLimits, SkillHost, ABI, CATALOG};
+use novbot_node::{apply_dispatch_overlay, execute_spec};
 use novbot_proto::control_client::ControlClient;
 use novbot_proto::{
     client_message, server_message, ClientMessage, Dispatch, HeartbeatRequest, NodeReady,
@@ -197,13 +198,16 @@ async fn main() -> Result<()> {
         let state = state.clone();
         let spool = spool.clone();
         let data_dir = args.data_dir.clone();
+        let skills = skills.clone();
         let every = Duration::from_secs(args.scheduler_tick_secs.max(1));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(every);
             loop {
                 ticker.tick().await;
-                if let Err(e) =
-                    run_due(&node_id, &state, &spool, &data_dir, &out, None, policy).await
+                if let Err(e) = run_due(
+                    &node_id, &state, &spool, &data_dir, &out, None, &skills, policy,
+                )
+                .await
                 {
                     tracing::warn!(error = %e, "scheduler tick failed");
                 }
@@ -598,7 +602,7 @@ async fn on_server(
             tracing::info!(generation = push.config_generation, "schedules pushed");
         }
         server_message::Body::Dispatch(d) => {
-            run_dispatch(node_id, state, spool, data_dir, out, &d, policy).await?;
+            run_dispatch(node_id, state, spool, data_dir, out, skills, &d, policy).await?;
         }
         server_message::Body::DesiredSkills(_)
         | server_message::Body::ReportResult(_)
@@ -675,6 +679,7 @@ async fn send_node_ready(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_due(
     node_id: &str,
     state: &Arc<RwLock<RuntimeState>>,
@@ -682,6 +687,7 @@ async fn run_due(
     data_dir: &PathBuf,
     out: &SessionOut,
     only_spec: Option<&str>,
+    skills: &SkillHost,
     policy: ProbePolicy,
 ) -> Result<()> {
     let specs: Vec<Spec> = {
@@ -709,10 +715,7 @@ async fn run_due(
     for spec in specs {
         let run_id = Uuid::new_v4().to_string();
         let observed_at = Utc::now().timestamp_millis();
-        let (status, payload) = match run_probe(&spec, &policy).await {
-            Ok(out) => (out.status.to_string(), out.payload),
-            Err(e) => ("error".to_string(), json!({"error": e.to_string()})),
-        };
+        let (status, payload) = execute_spec(&spec, &policy, skills, data_dir, &run_id).await;
         let payload_json = serde_json::to_string(&payload)?;
         let egress = json!({
             "node_id": node_id,
@@ -751,12 +754,14 @@ async fn run_due(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_dispatch(
     node_id: &str,
     state: &Arc<RwLock<RuntimeState>>,
     spool: &Arc<RetrySpool>,
     data_dir: &PathBuf,
     out: &SessionOut,
+    skills: &SkillHost,
     d: &Dispatch,
     policy: ProbePolicy,
 ) -> Result<()> {
@@ -796,24 +801,9 @@ async fn run_dispatch(
             )
         }
         Ok(mut spec) => {
-            if !d.params_json.trim().is_empty() {
-                if let Ok(overlay) = serde_json::from_str::<serde_json::Value>(&d.params_json) {
-                    if let Some(obj) = overlay.as_object() {
-                        if !spec.params.is_object() {
-                            spec.params = json!({});
-                        }
-                        let base = spec.params.as_object_mut().unwrap();
-                        for (k, v) in obj {
-                            base.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
+            apply_dispatch_overlay(&mut spec, &d.params_json);
             let observed_at = Utc::now().timestamp_millis();
-            let (status, payload) = match run_probe(&spec, &policy).await {
-                Ok(out) => (out.status.to_string(), out.payload),
-                Err(e) => ("error".to_string(), json!({"error": e.to_string()})),
-            };
+            let (status, payload) = execute_spec(&spec, &policy, skills, data_dir, &run_id).await;
             (spec.id, status, payload, observed_at)
         }
     };
@@ -853,6 +843,33 @@ async fn run_dispatch(
     };
     send_report_or_spool(out, spool, msg, pending).await?;
     Ok(())
+}
+
+#[cfg(test)]
+struct IdleSource;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl novbot_node::skills::ArtifactSource for IdleSource {
+    async fn fetch(
+        &self,
+        _: &str,
+        _: &str,
+        _: u64,
+    ) -> std::result::Result<novbot_node::skills::Fetched, String> {
+        Err("no artifact".into())
+    }
+}
+
+#[cfg(test)]
+async fn idle_skills(data_dir: &std::path::Path) -> SkillHost {
+    SkillHost::open(
+        data_dir,
+        std::sync::Arc::new(IdleSource),
+        InstallLimits::default(),
+    )
+    .await
+    .expect("skill host")
 }
 
 async fn flush_spool(spool: &RetrySpool, out: &SessionOut) -> Result<()> {
@@ -920,7 +937,7 @@ mod label_tests {
 
 #[cfg(test)]
 mod exec_gate_tests {
-    use super::{apply_config, run_dispatch, run_due, Args, RuntimeState, SessionOut};
+    use super::{apply_config, idle_skills, run_dispatch, run_due, Args, RuntimeState, SessionOut};
     use clap::Parser;
     use novbot_core::{ProbePolicy, RetrySpool};
     use novbot_proto::Dispatch;
@@ -981,6 +998,7 @@ mod exec_gate_tests {
         .unwrap();
 
         let out: SessionOut = Arc::new(RwLock::new(None));
+        let skills = idle_skills(&data_dir).await;
         let result = run_due(
             "node-1",
             &state,
@@ -988,6 +1006,7 @@ mod exec_gate_tests {
             &data_dir,
             &out,
             None,
+            &skills,
             ProbePolicy::default(),
         )
         .await;
@@ -1020,6 +1039,7 @@ mod exec_gate_tests {
         .unwrap();
 
         let out: SessionOut = Arc::new(RwLock::new(None));
+        let skills = idle_skills(&data_dir).await;
         let dispatch = Dispatch {
             run_id: "run-1".into(),
             spec_id: spec_id.into(),
@@ -1031,6 +1051,7 @@ mod exec_gate_tests {
             &spool,
             &data_dir,
             &out,
+            &skills,
             &dispatch,
             ProbePolicy::default(),
         )
@@ -1046,17 +1067,7 @@ mod exec_gate_tests {
 
 #[cfg(test)]
 mod dispatch_ready_tests {
-    use super::{apply_config, on_server, run_dispatch, RuntimeState, SessionOut};
-    use novbot_node::skills::{ArtifactSource, Fetched, InstallLimits, SkillHost};
-
-    struct IdleSource;
-
-    #[async_trait::async_trait]
-    impl ArtifactSource for IdleSource {
-        async fn fetch(&self, _: &str, _: &str, _: u64) -> Result<Fetched, String> {
-            Err("no artifact".into())
-        }
-    }
+    use super::{apply_config, idle_skills, on_server, run_dispatch, RuntimeState, SessionOut};
     use novbot_core::{ProbePolicy, RetrySpool};
     use novbot_proto::{
         client_message, server_message, Dispatch, PullConfigResponse, ServerMessage,
@@ -1112,12 +1123,14 @@ mod dispatch_ready_tests {
             spec_id: "host-skill".into(),
             params_json: "{}".into(),
         };
+        let skills = idle_skills(&h.data_dir).await;
         let result = run_dispatch(
             "node-1",
             &h.state,
             &h.spool,
             &h.data_dir,
             &h.out,
+            &skills,
             &dispatch,
             ProbePolicy::default(),
         )
@@ -1159,12 +1172,14 @@ mod dispatch_ready_tests {
             spec_id: "other-spec".into(),
             params_json: "{}".into(),
         };
+        let skills = idle_skills(&h.data_dir).await;
         let result = run_dispatch(
             "node-1",
             &h.state,
             &h.spool,
             &h.data_dir,
             &h.out,
+            &skills,
             &dispatch,
             ProbePolicy::default(),
         )
@@ -1192,13 +1207,7 @@ mod dispatch_ready_tests {
                 schedules_json: "[]".into(),
             })),
         };
-        let skills = SkillHost::open(
-            &h.data_dir,
-            std::sync::Arc::new(IdleSource),
-            InstallLimits::default(),
-        )
-        .await
-        .unwrap();
+        let skills = idle_skills(&h.data_dir).await;
         on_server(
             "node-1",
             &h.state,
@@ -1248,12 +1257,14 @@ mod dispatch_ready_tests {
             spec_id: "host-skill".into(),
             params_json: String::new(),
         };
+        let skills = idle_skills(&h.data_dir).await;
         let result = run_dispatch(
             "node-1",
             &h.state,
             &h.spool,
             &h.data_dir,
             &h.out,
+            &skills,
             &dispatch,
             ProbePolicy::default(),
         )
@@ -1265,5 +1276,139 @@ mod dispatch_ready_tests {
         assert_eq!(items[0].status, "ok");
         assert_eq!(items[0].run_id, "run-ok");
         assert_eq!(items[0].spec_id, "host-skill");
+    }
+
+    #[tokio::test]
+    async fn dispatch_installed_skill_lands_on_the_spool() {
+        use novbot_node::skills::{
+            current_platform, pack_skill, sha256_hex, ArtifactSource, DesiredSet, DesiredSkill,
+            Fetched, InstallLimits, PackSpec, SkillPolicy, ABI,
+        };
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+
+        const GUEST: &[u8] = include_bytes!("../../novbot-skill-runtime/guest/skill.wasm");
+
+        struct BytesSource {
+            files: Mutex<BTreeMap<String, Vec<u8>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ArtifactSource for BytesSource {
+            async fn fetch(
+                &self,
+                sha256: &str,
+                ticket: &str,
+                offset: u64,
+            ) -> Result<Fetched, String> {
+                if ticket.is_empty() {
+                    return Err("missing fetch ticket".into());
+                }
+                let bytes = self
+                    .files
+                    .lock()
+                    .unwrap()
+                    .get(sha256)
+                    .cloned()
+                    .ok_or_else(|| "artifact missing".to_string())?;
+                let start = usize::try_from(offset)
+                    .unwrap_or(usize::MAX)
+                    .min(bytes.len());
+                Ok(Fetched {
+                    total_size: bytes.len() as u64,
+                    data: bytes[start..].to_vec(),
+                })
+            }
+        }
+
+        let bytes = pack_skill(&PackSpec {
+            name: "guest-info".into(),
+            version: "1.0.0".into(),
+            wasm: GUEST.to_vec(),
+            grants: vec![("sys.info.read".into(), None)],
+            platforms: vec![current_platform()],
+            timeout_ms: Some(5_000),
+            memory_mb: Some(32),
+        });
+        let sha = sha256_hex(&bytes);
+        let source = std::sync::Arc::new(BytesSource {
+            files: Mutex::new(BTreeMap::from([(sha.clone(), bytes.clone())])),
+        });
+        let h = harness();
+        let skills = novbot_node::skills::SkillHost::open(
+            &h.data_dir,
+            source,
+            InstallLimits {
+                max_attempts: 2,
+                max_elapsed: std::time::Duration::from_secs(120),
+                min_backoff: std::time::Duration::ZERO,
+                max_backoff: std::time::Duration::ZERO,
+                ready_bound: std::time::Duration::from_millis(20),
+                sleeper: std::sync::Arc::new(|_| Box::pin(async {})),
+            },
+        )
+        .await
+        .expect("skill host");
+        let snap = skills
+            .reconcile(DesiredSet {
+                generation: 1,
+                policy: SkillPolicy::default(),
+                skills: vec![DesiredSkill {
+                    name: "guest-info".into(),
+                    version: "1.0.0".into(),
+                    sha256: sha.clone(),
+                    size_bytes: bytes.len() as u64,
+                    abi: ABI.into(),
+                    capabilities_sha256: String::new(),
+                    signature_envelope: Vec::new(),
+                    fetch_ticket: format!("ticket-{sha}"),
+                }],
+            })
+            .await;
+        assert_eq!(snap.skills[0].state, "installed", "{snap:?}");
+        assert_eq!(skills.wasm_run_entries(), 0);
+
+        apply_config(
+            &h.state,
+            3,
+            &serde_json::json!([{
+                "id": "guest-skill",
+                "kind": "skill",
+                "params": {"skill": "guest-info", "arguments": {"op": "info"}}
+            }])
+            .to_string(),
+            "[]",
+            ProbePolicy::default(),
+        )
+        .await
+        .unwrap();
+        let dispatch = Dispatch {
+            run_id: "run-guest".into(),
+            spec_id: "guest-skill".into(),
+            params_json: String::new(),
+        };
+        run_dispatch(
+            "node-1",
+            &h.state,
+            &h.spool,
+            &h.data_dir,
+            &h.out,
+            &skills,
+            &dispatch,
+            ProbePolicy::default(),
+        )
+        .await
+        .unwrap();
+        let items = h.spool.drain().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "ok");
+        assert_eq!(items[0].run_id, "run-guest");
+        let payload: serde_json::Value = serde_json::from_str(&items[0].payload_json).unwrap();
+        assert_eq!(payload["skill"]["name"], "guest-info");
+        assert_eq!(payload["skill"]["version"], "1.0.0");
+        assert!(payload["hostname"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()));
+        assert_eq!(skills.wasm_run_entries(), 1);
     }
 }

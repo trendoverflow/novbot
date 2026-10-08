@@ -421,20 +421,20 @@ async fn handle(
                 .timestamp_millis_opt(req.observed_at_unix_ms)
                 .single()
                 .unwrap_or_else(Utc::now);
-            let accepted = match db
-                .insert_result(
-                    &req.node_id,
-                    &req.run_id,
-                    &req.spec_id,
-                    &req.status,
-                    &req.payload_json,
-                    observed,
-                )
-                .await
+            let accepted = match crate::skill_desired::store_reported_result(
+                db,
+                &req.node_id,
+                &req.run_id,
+                &req.spec_id,
+                &req.status,
+                &req.payload_json,
+                observed,
+            )
+            .await
             {
                 Ok(()) => true,
                 Err(e) => {
-                    tracing::warn!(error = %e, "insert_result failed");
+                    tracing::warn!(error = ?e, "insert_result failed");
                     false
                 }
             };

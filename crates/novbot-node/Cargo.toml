@@ -28,6 +28,8 @@ chrono = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 hostname = { workspace = true }
+jsonschema = "=0.30.0"
+semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

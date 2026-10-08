@@ -13,7 +13,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
@@ -36,6 +36,8 @@ const SKILL_ABI: &str = "novbot:skill@1";
 pub struct SkillRuntime {
     engine: Engine,
     cache: Mutex<Option<(u64, Component)>>,
+    /// Entries into [`run`], including runs that fail before the guest is called.
+    entries: AtomicU64,
 }
 
 pub struct RunRequest<'a> {
@@ -69,7 +71,13 @@ impl SkillRuntime {
         Ok(Self {
             engine,
             cache: Mutex::new(None),
+            entries: AtomicU64::new(0),
         })
+    }
+
+    /// How many times [`run`] has been entered on this runtime.
+    pub fn run_entries(&self) -> u64 {
+        self.entries.load(Ordering::SeqCst)
     }
 
     /// Filesystem-safe id: wasmtime version, target, and the engine's precompile hash.
@@ -125,6 +133,7 @@ impl SkillRuntime {
 }
 
 pub fn run(runtime: &SkillRuntime, request: RunRequest<'_>) -> RunOutput {
+    runtime.entries.fetch_add(1, Ordering::SeqCst);
     let grants = match GrantSet::parse(request.grants) {
         Ok(grants) => grants,
         Err(err) => {
