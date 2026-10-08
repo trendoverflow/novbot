@@ -3,14 +3,16 @@
 
 use crate::db::{Db, NodeConfig, NodeRow, ResultRow};
 use crate::hub::Hub;
+use crate::skill_bundles;
 use crate::skill_catalog::{self, HubSkillItem, SkillDetail, VersionDetail};
+use crate::skill_desired;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use novbot_proto::{server_message, Dispatch, ServerMessage};
 use serde::{Deserialize, Serialize};
@@ -43,6 +45,7 @@ pub fn router(state: AppState) -> Router {
             get(get_schedules).put(put_schedules),
         )
         .route("/nodes/{id}/dispatch", post(dispatch_command))
+        .route("/nodes/{id}/skills", get(get_node_skills))
         .route("/results", get(list_results))
         .route("/license", get(get_license).put(put_license))
         .route(
@@ -57,12 +60,38 @@ pub fn router(state: AppState) -> Router {
             "/skills/{name}/versions/{version}/package",
             get(get_skill_package),
         )
+        .route("/skills/{name}/install", post(install_skill))
+        .route("/skills/{name}/rollback", post(rollback_skill))
+        .route("/skills/{name}/uninstall", post(uninstall_skill))
+        .route("/skill-operations", get(list_skill_operations))
+        .route("/skill-operations/{id}", get(get_skill_operation))
+        .route("/skill-capabilities", get(list_skill_capabilities))
+        .route("/audit-events", get(list_audit_events))
+        .route(
+            "/skill-bundles",
+            get(list_skill_bundles).post(create_skill_bundle),
+        )
+        .route(
+            "/skill-bundles/{id}",
+            get(get_skill_bundle)
+                .put(replace_skill_bundle)
+                .delete(delete_skill_bundle),
+        )
+        .route("/skill-bundles/{id}/install", post(install_skill_bundle))
+        .route("/skill-bundles/{id}/run", post(run_skill_bundle))
+        .route("/skill-imports", any(license_stub))
+        .route("/skill-imports/{id}", any(license_stub))
         .route("/fleet/skill-groups", get(list_skill_groups))
         .route("/fleet/skill-groups/push", post(push_skill_group))
         .route("/tokens", get(tokens_status).post(create_token))
         // EE / report paths — closed without license (M7 stub).
         .route("/ee/reports", get(ee_reports))
         .route("/ee/reports/{id}", get(ee_report_by_id))
+        .route("/ee/skills/approvals", any(license_stub))
+        .route("/ee/skills/rollouts", any(license_stub))
+        .route("/ee/skills/registries", any(license_stub))
+        .route("/ee/skills/trusted-keys", any(license_stub))
+        .route("/ee/audit/export", any(license_stub))
         .route_layer(from_fn_with_state(state.clone(), require_api_token));
 
     Router::new()
@@ -100,7 +129,8 @@ where
 }
 
 async fn list_skills(State(st): State<AppState>) -> Result<Json<ListSkillsBody>, ApiError> {
-    let items = skill_catalog::list_hub_items(&st.db).await?;
+    let mut items = skill_catalog::list_hub_items(&st.db).await?;
+    items.extend(skill_catalog::builtin_list_items());
     Ok(Json(ListSkillsBody {
         skills: novbot_core::list_skills(),
         items,
@@ -153,6 +183,9 @@ async fn get_skill(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<SkillDetail>, ApiError> {
+    if let Some(detail) = skill_catalog::builtin_detail(&name) {
+        return Ok(Json(detail));
+    }
     Ok(Json(skill_catalog::get_skill(&st.db, &name).await?))
 }
 
@@ -171,6 +204,153 @@ async fn get_skill_package(
 ) -> Result<Response, ApiError> {
     let bytes = skill_catalog::read_package(&st.db, &name, &version).await?;
     Ok(([(header::CONTENT_TYPE, CONTENT_TYPE_SKILL)], bytes).into_response())
+}
+
+async fn install_skill(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<skill_desired::InstallRequest>,
+) -> Result<(StatusCode, Json<skill_desired::ChangeResponse>), ApiError> {
+    let response = skill_desired::install(&st.db, &st.hub, &name, body).await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn rollback_skill(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<skill_desired::RollbackRequest>,
+) -> Result<(StatusCode, Json<skill_desired::ChangeResponse>), ApiError> {
+    let response = skill_desired::rollback(&st.db, &st.hub, &name, body).await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn uninstall_skill(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<skill_desired::UninstallRequest>,
+) -> Result<(StatusCode, Json<skill_desired::ChangeResponse>), ApiError> {
+    let response = skill_desired::uninstall(&st.db, &st.hub, &name, body).await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn list_skill_operations(
+    State(st): State<AppState>,
+    Query(query): Query<skill_desired::ListLimit>,
+) -> Result<Json<skill_desired::OperationList>, ApiError> {
+    Ok(Json(
+        skill_desired::list_operations(&st.db, query.limit).await?,
+    ))
+}
+
+async fn get_skill_operation(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<skill_desired::OperationView>, ApiError> {
+    Ok(Json(skill_desired::get_operation(&st.db, &id).await?))
+}
+
+async fn get_node_skills(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<skill_desired::NodeSkillsResponse>, ApiError> {
+    Ok(Json(
+        skill_desired::node_skills(&st.db, &st.hub, &id).await?,
+    ))
+}
+
+async fn list_skill_capabilities() -> Json<skill_desired::CapabilityCatalog> {
+    Json(skill_desired::capability_catalog())
+}
+
+async fn list_audit_events(
+    State(st): State<AppState>,
+    Query(query): Query<skill_desired::AuditQuery>,
+) -> Result<Json<skill_desired::AuditList>, ApiError> {
+    Ok(Json(skill_desired::list_audit(&st.db, query).await?))
+}
+
+async fn list_skill_bundles(
+    State(st): State<AppState>,
+) -> Result<Json<skill_bundles::BundleList>, ApiError> {
+    Ok(Json(skill_bundles::list_bundles(&st.db).await?))
+}
+
+async fn create_skill_bundle(
+    State(st): State<AppState>,
+    Json(body): Json<skill_bundles::BundleCreate>,
+) -> Result<(StatusCode, Json<skill_bundles::BundleView>), ApiError> {
+    let bundle = skill_bundles::create_bundle(&st.db, body).await?;
+    Ok((StatusCode::CREATED, Json(bundle)))
+}
+
+async fn get_skill_bundle(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<skill_bundles::BundleView>, ApiError> {
+    Ok(Json(skill_bundles::get_bundle(&st.db, &id).await?))
+}
+
+async fn replace_skill_bundle(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<skill_bundles::BundleReplace>,
+) -> Result<Json<skill_bundles::BundleView>, ApiError> {
+    Ok(Json(
+        skill_bundles::replace_bundle(&st.db, &id, body).await?,
+    ))
+}
+
+async fn delete_skill_bundle(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    skill_bundles::delete_bundle(&st.db, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn install_skill_bundle(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<skill_bundles::BundleInstallRequest>,
+) -> Result<(StatusCode, Json<skill_bundles::BundleInstallResponse>), ApiError> {
+    let response = skill_bundles::install_bundle(&st.db, &st.hub, &id, body).await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+#[derive(Debug, Deserialize)]
+struct RunBundleBody {
+    node_ids: Vec<String>,
+}
+
+async fn run_skill_bundle(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RunBundleBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let group = skill_bundles::fleet_group(&st.db, &id).await?;
+    if body.node_ids.is_empty() {
+        return Err(ApiError::bad_request("node_ids must not be empty"));
+    }
+    let results = dispatch_named_skills(&st, &group.skills, &body.node_ids).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "accepted": true,
+            "bundle_id": group.id,
+            "group_id": group.id,
+            "group_name": group.name,
+            "skills": group.skills,
+            "results": results,
+        })),
+    ))
+}
+
+async fn license_stub() -> Result<Json<Value>, ApiError> {
+    Err(ApiError::coded(
+        StatusCode::PAYMENT_REQUIRED,
+        "license_required",
+        "license required",
+    ))
 }
 
 const CONTENT_TYPE_SKILL: &str = "application/vnd.novbot.skill";
@@ -205,47 +385,12 @@ async fn require_api_token(
     Ok(next.run(req).await)
 }
 
-#[derive(Clone, Copy)]
-struct SkillGroupDef {
-    id: &'static str,
-    name: &'static str,
-    description: &'static str,
-    skills: &'static [&'static str],
-}
-
-fn skill_group_registry() -> &'static [SkillGroupDef] {
-    &[
-        SkillGroupDef {
-            id: "host-basics",
-            name: "Host basics",
-            description: "host_info + echo (demo fleet push)",
-            skills: &["host_info", "echo"],
-        },
-        SkillGroupDef {
-            id: "env-sample",
-            name: "Env sample",
-            description: "env_get only",
-            skills: &["env_get"],
-        },
-    ]
-}
-
-async fn list_skill_groups() -> impl IntoResponse {
-    let groups: Vec<_> = skill_group_registry()
-        .iter()
-        .map(|g| {
-            serde_json::json!({
-                "id": g.id,
-                "name": g.name,
-                "description": g.description,
-                "skills": g.skills,
-            })
-        })
-        .collect();
-    Json(serde_json::json!({
+async fn list_skill_groups(State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let groups = skill_bundles::list_fleet_groups(&st.db).await?;
+    Ok(Json(serde_json::json!({
         "groups": groups,
         "note": "POST /v1/fleet/skill-groups/push with {group_id, node_ids[]} dispatches matching skill specs per node",
-    }))
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,21 +425,34 @@ async fn push_skill_group(
     State(st): State<AppState>,
     Json(body): Json<PushSkillGroupBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let group = skill_group_registry()
-        .iter()
-        .find(|g| g.id == body.group_id)
-        .ok_or_else(|| ApiError::not_found(format!("skill group '{}' not found", body.group_id)))?;
-
+    let group = skill_bundles::fleet_group(&st.db, &body.group_id).await?;
     if body.node_ids.is_empty() {
         return Err(ApiError::bad_request("node_ids must not be empty"));
     }
+    let results = dispatch_named_skills(&st, &group.skills, &body.node_ids).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "accepted": true,
+            "group_id": group.id,
+            "group_name": group.name,
+            "skills": group.skills,
+            "results": results,
+        })),
+    ))
+}
 
+async fn dispatch_named_skills(
+    st: &AppState,
+    skills: &[String],
+    node_ids: &[String],
+) -> Result<Vec<Value>, ApiError> {
     let mut results = Vec::new();
-    for node_id in &body.node_ids {
+    for node_id in node_ids {
         let cfg = match st.db.get_config(node_id).await? {
-            Some(c) => c,
+            Some(config) => config,
             None => {
-                for skill in group.skills {
+                for skill in skills {
                     results.push(serde_json::json!({
                         "node_id": node_id,
                         "skill": skill,
@@ -307,10 +465,9 @@ async fn push_skill_group(
         };
         let specs: Value =
             serde_json::from_str(&cfg.specs_json).unwrap_or_else(|_| Value::Array(vec![]));
-
-        for skill in group.skills {
+        for skill in skills {
             let spec_id = resolve_spec_id_for_skill(&specs, skill);
-            match dispatch_to_node(&st, node_id, &spec_id, None, None).await {
+            match dispatch_to_node(st, node_id, &spec_id, None, None).await {
                 Ok((run_id, delivered)) => results.push(serde_json::json!({
                     "node_id": node_id,
                     "skill": skill,
@@ -319,27 +476,17 @@ async fn push_skill_group(
                     "status": "ok",
                     "delivered": delivered,
                 })),
-                Err(e) => results.push(serde_json::json!({
+                Err(err) => results.push(serde_json::json!({
                     "node_id": node_id,
                     "skill": skill,
                     "spec_id": spec_id,
                     "status": "error",
-                    "error": e.message,
+                    "error": err.message,
                 })),
             }
         }
     }
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "accepted": true,
-            "group_id": group.id,
-            "group_name": group.name,
-            "skills": group.skills,
-            "results": results,
-        })),
-    ))
+    Ok(results)
 }
 
 async fn tokens_status(State(st): State<AppState>) -> impl IntoResponse {
@@ -487,11 +634,18 @@ async fn dispatch_command(
     Path(id): Path<String>,
     Json(body): Json<DispatchBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _ = st
+    let cfg = st
         .db
         .get_config(&id)
         .await?
         .ok_or_else(|| ApiError::not_found("node config not found; PUT config first"))?;
+    if !spec_present(&cfg.specs_json, &body.spec_id) {
+        return Err(ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "spec_unknown",
+            "unknown spec",
+        ));
+    }
 
     let (run_id, delivered) =
         dispatch_to_node(&st, &id, &body.spec_id, body.params, body.run_id).await?;
@@ -506,6 +660,18 @@ async fn dispatch_command(
             "delivered": delivered,
         })),
     ))
+}
+
+fn spec_present(specs_json: &str, spec_id: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(specs_json) else {
+        return false;
+    };
+    let Some(specs) = value.as_array() else {
+        return false;
+    };
+    specs
+        .iter()
+        .any(|spec| spec.get("id").and_then(Value::as_str) == Some(spec_id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -612,6 +778,7 @@ struct ApiError {
     status: StatusCode,
     message: String,
     code: Option<String>,
+    extra: Option<Value>,
 }
 
 impl ApiError {
@@ -620,7 +787,13 @@ impl ApiError {
             status,
             message: message.into(),
             code: Some(code.to_string()),
+            extra: None,
         }
+    }
+
+    fn with_extra(mut self, extra: Value) -> Self {
+        self.extra = Some(extra);
+        self
     }
 
     fn not_found(msg: impl Into<String>) -> Self {
@@ -628,6 +801,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             message: msg.into(),
             code: None,
+            extra: None,
         }
     }
 
@@ -636,6 +810,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
             code: None,
+            extra: None,
         }
     }
 
@@ -644,6 +819,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             message: msg.into(),
             code: None,
+            extra: None,
         }
     }
 
@@ -652,6 +828,7 @@ impl ApiError {
             status: StatusCode::PAYMENT_REQUIRED,
             message: msg.into(),
             code: None,
+            extra: None,
         }
     }
 }
@@ -662,6 +839,7 @@ impl From<anyhow::Error> for ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: e.to_string(),
             code: None,
+            extra: None,
         }
     }
 }
@@ -672,6 +850,7 @@ impl From<serde_json::Error> for ApiError {
             status: StatusCode::BAD_REQUEST,
             message: e.to_string(),
             code: None,
+            extra: None,
         }
     }
 }
@@ -694,6 +873,9 @@ impl From<skill_catalog::CatalogError> for ApiError {
             ),
             InvalidArchive(message) => {
                 ApiError::coded(StatusCode::BAD_REQUEST, "invalid_archive", message)
+            }
+            InvalidManifest(message) => {
+                ApiError::coded(StatusCode::BAD_REQUEST, "invalid_manifest", message)
             }
             InvalidWasm(message) => ApiError::coded(StatusCode::BAD_REQUEST, "invalid_wasm", message),
             HashMismatch => ApiError::coded(
@@ -730,17 +912,93 @@ impl From<skill_catalog::CatalogError> for ApiError {
     }
 }
 
+impl From<skill_desired::DesiredError> for ApiError {
+    fn from(err: skill_desired::DesiredError) -> Self {
+        use skill_desired::DesiredError::*;
+        match err {
+            SkillUnknown => {
+                ApiError::coded(StatusCode::NOT_FOUND, "skill_unknown", "unknown skill")
+            }
+            BuiltinReadOnly => ApiError::coded(
+                StatusCode::CONFLICT,
+                "builtin_read_only",
+                "built-in resource is read-only",
+            ),
+            VersionUnknown => ApiError::coded(
+                StatusCode::NOT_FOUND,
+                "version_unknown",
+                "unknown skill version",
+            ),
+            VersionNotInstallable => ApiError::coded(
+                StatusCode::CONFLICT,
+                "version_not_installable",
+                "skill version is not installable",
+            ),
+            CapabilitiesChanged => ApiError::coded(
+                StatusCode::CONFLICT,
+                "capabilities_changed",
+                "accepted capabilities hash does not match",
+            ),
+            NoTargetNodes => ApiError::coded(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no_target_nodes",
+                "no target nodes",
+            ),
+            NoPreviousVersion => ApiError::coded(
+                StatusCode::CONFLICT,
+                "no_previous_version",
+                "no previous version",
+            ),
+            SkillInUse {
+                spec_ids,
+                schedule_ids,
+            } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "skill_in_use",
+                "skill is referenced by a spec",
+            )
+            .with_extra(serde_json::json!({
+                "spec_ids": spec_ids,
+                "schedule_ids": schedule_ids,
+            })),
+            NodeUnknown => ApiError::coded(StatusCode::NOT_FOUND, "node_unknown", "unknown node"),
+            OperationUnknown => ApiError::coded(
+                StatusCode::NOT_FOUND,
+                "operation_unknown",
+                "unknown operation",
+            ),
+            BundleUnknown => {
+                ApiError::coded(StatusCode::NOT_FOUND, "bundle_unknown", "unknown bundle")
+            }
+            BundleExists => ApiError::coded(
+                StatusCode::CONFLICT,
+                "bundle_exists",
+                "bundle already exists",
+            ),
+            InvalidBundle(message) => {
+                ApiError::coded(StatusCode::BAD_REQUEST, "invalid_bundle", message)
+            }
+            BadRequest(message) => ApiError::bad_request(message),
+            Internal(err) => ApiError::from(err),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        (
-            self.status,
-            Json(serde_json::json!({
-                "error": self.message,
-                "license_required": self.status == StatusCode::PAYMENT_REQUIRED,
-                "code": self.code,
-            })),
-        )
-            .into_response()
+        let mut body = serde_json::json!({
+            "error": self.message,
+            "license_required": self.status == StatusCode::PAYMENT_REQUIRED,
+            "code": self.code,
+        });
+        if let (Some(object), Some(extra)) = (body.as_object_mut(), self.extra) {
+            if let Some(fields) = extra.as_object() {
+                for (key, value) in fields {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
