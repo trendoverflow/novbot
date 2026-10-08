@@ -10,10 +10,20 @@ description = "NovBot node daemon"
 name = "novbot-node"
 path = "src/main.rs"
 
+[lib]
+name = "novbot_node"
+path = "src/lib.rs"
+
 [dependencies]
 novbot-proto = { workspace = true }
 novbot-core = { workspace = true }
+novbot-skill-runtime = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+flate2 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }

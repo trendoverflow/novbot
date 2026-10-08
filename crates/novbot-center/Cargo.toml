@@ -37,5 +37,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+novbot-node = { path = "../novbot-node" }
+tempfile = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 tower = { workspace = true, features = ["util"] }

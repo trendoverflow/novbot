@@ -1,4 +1,5 @@
 /target/
+crates/novbot-skill-runtime/guest/target/
 **/*.rs.bk
 .DS_Store
 .env

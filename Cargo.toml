@@ -18,6 +18,7 @@ repository = "https://github.com/trendoverflow/novbot"
 [workspace.dependencies]
 novbot-proto = { path = "crates/novbot-proto" }
 novbot-core = { path = "crates/novbot-core" }
+novbot-skill-runtime = { path = "crates/novbot-skill-runtime" }
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }

@@ -13,17 +13,25 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::Result;
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 const STDOUT_CAP: usize = 64 * 1024;
 const LOG_LIMIT: usize = 32;
 const LOG_BYTES: usize = 1024;
+/// Epoch tick. A finite run deadline is this long, times the tick count.
+const EPOCH_MILLIS: u64 = 10;
+/// Ticks past the current epoch when the caller sets no deadline.
+/// `u64::MAX` wraps once the engine epoch is non-zero (`current + delta`).
+const OPEN_DEADLINE_TICKS: u64 = 1 << 62;
+
+const SKILL_ABI: &str = "novbot:skill@1";
 
 pub struct SkillRuntime {
     engine: Engine,
@@ -35,6 +43,10 @@ pub struct RunRequest<'a> {
     pub grants: &'a [&'a str],
     pub params_json: &'a str,
     pub data_dir: Option<&'a Path>,
+    /// `None` leaves the epoch deadline open. A value is clamped to at least one tick.
+    pub timeout: Option<Duration>,
+    /// `None` does not install a [`StoreLimits`] memory cap.
+    pub memory_bytes: Option<usize>,
 }
 
 pub(crate) struct RunCtx {
@@ -45,20 +57,56 @@ pub(crate) struct RunCtx {
     started: Instant,
     denials: Vec<Denial>,
     logs: Vec<(u8, String)>,
+    limits: StoreLimits,
 }
 
 impl SkillRuntime {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
         config.wasm_component_model(true);
-        // Epoch interruption is armed so a later task can set a deadline.
-        // This crate does not call `set_epoch_deadline` with a finite budget.
         config.epoch_interruption(true);
         let engine = Engine::new(&config)?;
         Ok(Self {
             engine,
             cache: Mutex::new(None),
         })
+    }
+
+    /// Filesystem-safe id: wasmtime version, target, and the engine's precompile hash.
+    ///
+    /// The hash covers CPU features. It is not a package digest.
+    pub fn engine_id(&self) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.engine
+            .precompile_compatibility_hash()
+            .hash(&mut hasher);
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        format!("wt49.0.2-{os}-{arch}-{:016x}", hasher.finish())
+    }
+
+    /// Compile `module.wasm` on this engine and return wasmtime serialized code.
+    ///
+    /// Precompiled bytes are rejected. Callers must not [`Component::deserialize`]
+    /// a payload that arrived from the center.
+    pub fn compile_cwasm(&self, module_wasm: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        if module_wasm.is_empty() || !module_wasm.starts_with(b"\0asm") {
+            return Err("compile_failed: module.wasm is not a wasm component".into());
+        }
+        let component = Component::new(&self.engine, module_wasm)
+            .map_err(|err| format!("compile_failed: {err}"))?;
+        for (name, _) in component.component_type().imports(&self.engine) {
+            if !import_allowed(name) {
+                return Err(format!(
+                    "compile_failed: import {name} is outside {SKILL_ABI}"
+                ));
+            }
+        }
+        component
+            .serialize()
+            .map_err(|err| format!("compile_failed: {err}"))
     }
 
     fn component(&self, bytes: &[u8]) -> anyhow::Result<Component> {
@@ -89,10 +137,51 @@ pub fn run(runtime: &SkillRuntime, request: RunRequest<'_>) -> RunOutput {
             return RunOutput::error("invalid_component", err.to_string(), Vec::new(), None);
         }
     };
-    match invoke(runtime, &component, grants, &request) {
+    let invoke_result = if request.timeout.is_some() {
+        with_epoch_ticks(&runtime.engine, || {
+            invoke(runtime, &component, grants, &request)
+        })
+    } else {
+        invoke(runtime, &component, grants, &request)
+    };
+    match invoke_result {
         Ok(output) => output,
         Err(err) => RunOutput::error("runtime_error", err.to_string(), Vec::new(), None),
     }
+}
+
+fn with_epoch_ticks<T>(engine: &Engine, body: impl FnOnce() -> T) -> T {
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let engine = engine.clone();
+    let ticker = std::thread::Builder::new()
+        .name("skill-epoch".into())
+        .spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(EPOCH_MILLIS));
+                engine.increment_epoch();
+            }
+        })
+        .ok();
+    let result = body();
+    stop.store(true, Ordering::Relaxed);
+    if let Some(ticker) = ticker {
+        let _ = ticker.join();
+    }
+    result
+}
+
+fn import_allowed(name: &str) -> bool {
+    name.starts_with("novbot:skill/") || name.starts_with("wasi:")
+}
+
+fn deadline_ticks(timeout: Option<Duration>) -> u64 {
+    let Some(timeout) = timeout else {
+        return OPEN_DEADLINE_TICKS;
+    };
+    let millis = timeout.as_millis().max(1);
+    let ticks = millis.div_ceil(u128::from(EPOCH_MILLIS));
+    u64::try_from(ticks).unwrap_or(u64::MAX).max(1)
 }
 
 fn invoke(
@@ -119,12 +208,25 @@ fn invoke(
         started: Instant::now(),
         denials: Vec::new(),
         logs: Vec::new(),
+        limits: memory_limits(request.memory_bytes),
     };
     let mut store = Store::new(&runtime.engine, ctx);
-    // A deadline of u64::MAX does not fire. SH-3 does not enforce a run timeout.
-    store.set_epoch_deadline(u64::MAX);
+    if request.memory_bytes.is_some() {
+        store.limiter(|ctx| &mut ctx.limits);
+    }
+    store.set_epoch_deadline(deadline_ticks(request.timeout));
 
-    let instance = crate::Skill::instantiate(&mut store, component, &linker)?;
+    let instance = match crate::Skill::instantiate(&mut store, component, &linker) {
+        Ok(instance) => instance,
+        Err(err) => {
+            return Ok(RunOutput::error(
+                trap_code(&err),
+                err.to_string(),
+                Vec::new(),
+                None,
+            ));
+        }
+    };
     let guest = instance.call_run(&mut store, request.params_json);
     Ok(finish(&mut store, guest))
 }
@@ -148,7 +250,36 @@ fn finish(store: &mut Store<RunCtx>, guest: Result<Result<String, String>>) -> R
     match guest {
         Ok(Ok(output)) => RunOutput::ok(output),
         Ok(Err(message)) => RunOutput::error("guest_error", message, Vec::new(), None),
-        Err(err) => RunOutput::error("guest_trap", err.to_string(), Vec::new(), None),
+        Err(err) => {
+            let code = trap_code(&err);
+            RunOutput::error(code, err.to_string(), Vec::new(), None)
+        }
+    }
+}
+
+fn memory_limits(memory_bytes: Option<usize>) -> StoreLimits {
+    match memory_bytes {
+        Some(limit) => StoreLimitsBuilder::new()
+            .memory_size(limit)
+            .trap_on_grow_failure(true)
+            .build(),
+        None => StoreLimits::default(),
+    }
+}
+
+fn trap_code(err: &wasmtime::Error) -> &'static str {
+    let text = format!("{err:#}").to_ascii_lowercase();
+    if text.contains("epoch")
+        || text.contains("interrupt")
+        || err
+            .downcast_ref::<wasmtime::Trap>()
+            .is_some_and(|trap| matches!(trap, wasmtime::Trap::Interrupt))
+    {
+        "exec_timeout"
+    } else if text.contains("memory") || text.contains("resource") {
+        "resource_limit"
+    } else {
+        "guest_trap"
     }
 }
 

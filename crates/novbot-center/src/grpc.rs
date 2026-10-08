@@ -1,15 +1,18 @@
 // Copyright 2026 TrendOverflow / NovHub
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::artifact::ArtifactStore;
 use crate::db::Db;
 use crate::hub::Hub;
+use crate::skill_delivery;
 use anyhow::Result;
 use chrono::{TimeZone, Utc};
 use futures::Stream;
 use novbot_proto::control_server::{Control, ControlServer};
 use novbot_proto::{
-    client_message, server_message, Ack, ClientMessage, Dispatch, ErrorResponse, HeartbeatResponse,
-    PullConfigResponse, RegisterResponse, ReportResultResponse, ServerMessage,
+    client_message, server_message, Ack, ArtifactChunk, ClientMessage, Dispatch, ErrorResponse,
+    FetchArtifactRequest, HeartbeatResponse, PullConfigResponse, RegisterResponse,
+    ReportResultResponse, ServerMessage,
 };
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -110,10 +113,12 @@ impl ReadyGate {
 }
 
 type OutStream = Pin<Box<dyn Stream<Item = Result<ServerMessage, Status>> + Send + 'static>>;
+type ArtifactStream = Pin<Box<dyn Stream<Item = Result<ArtifactChunk, Status>> + Send + 'static>>;
 
 #[tonic::async_trait]
 impl Control for ControlSvc {
     type SessionStream = OutStream;
+    type FetchArtifactStream = ArtifactStream;
 
     async fn session(
         &self,
@@ -152,7 +157,7 @@ impl Control for ControlSvc {
                         };
                         let node_hint = client_node_id(&msg);
                         let (reply, node_id) =
-                            handle(&db, expected.as_deref(), msg, node_hint.as_deref()).await;
+                            handle(&db, &hub, expected.as_deref(), msg, node_hint.as_deref()).await;
 
                         if let Some(nid) = node_id {
                             if bound_node.as_deref() != Some(nid.as_str()) {
@@ -232,6 +237,30 @@ impl Control for ControlSvc {
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+
+    async fn fetch_artifact(
+        &self,
+        request: Request<FetchArtifactRequest>,
+    ) -> Result<Response<Self::FetchArtifactStream>, Status> {
+        let req = request.into_inner();
+        if let Err(reason) = self
+            .hub
+            .check_ticket(&req.fetch_ticket, &req.node_id, &req.sha256)
+        {
+            tracing::warn!("{}", skill_delivery::rejection_log(reason));
+            return Err(Status::permission_denied("fetch ticket rejected"));
+        }
+        let stored = ArtifactStore::get(&self.db, req.sha256.trim())
+            .await
+            .map_err(|_| Status::internal("artifact lookup failed"))?;
+        let Some(bytes) = stored else {
+            return Err(Status::not_found("artifact not found"));
+        };
+        let chunks =
+            skill_delivery::artifact_chunks(&bytes, req.offset).map_err(Status::out_of_range)?;
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok));
+        Ok(Response::new(Box::pin(stream)))
+    }
 }
 
 fn client_node_id(msg: &ClientMessage) -> Option<String> {
@@ -240,6 +269,8 @@ fn client_node_id(msg: &ClientMessage) -> Option<String> {
         client_message::Body::Heartbeat(r) => Some(r.node_id.clone()),
         client_message::Body::PullConfig(r) => Some(r.node_id.clone()),
         client_message::Body::ReportResult(r) => Some(r.node_id.clone()),
+        client_message::Body::PullSkills(r) => Some(r.node_id.clone()),
+        client_message::Body::SkillState(r) => Some(r.node_id.clone()),
         // NodeReady must not bind a session. The loop applies it only when already bound.
         client_message::Body::NodeReady(_) => None,
         client_message::Body::Ack(_) => None,
@@ -248,6 +279,7 @@ fn client_node_id(msg: &ClientMessage) -> Option<String> {
 
 async fn handle(
     db: &Db,
+    hub: &Hub,
     expected_token: Option<&str>,
     msg: ClientMessage,
     _node_hint: Option<&str>,
@@ -285,6 +317,7 @@ async fn handle(
                 Err(e) => (false, e.to_string()),
             };
             let bound = if accepted {
+                hub.note_abi(&node_id, &req.skill_abi);
                 Some(node_id.clone())
             } else {
                 None
@@ -305,16 +338,58 @@ async fn handle(
             let node_id = req.node_id.clone();
             let _ = db.touch_node(&req.node_id).await;
             let center_config_generation = db.config_generation(&req.node_id).await.unwrap_or(0);
+            let center_skill_set_generation = skill_delivery::generation(db, &req.node_id)
+                .await
+                .unwrap_or(0);
             (
                 ServerMessage {
                     request_id,
                     body: Some(server_message::Body::Heartbeat(HeartbeatResponse {
                         ok: true,
                         center_config_generation,
+                        center_skill_set_generation,
                     })),
                 },
                 Some(node_id),
             )
+        }
+        client_message::Body::PullSkills(req) => {
+            let node_id = req.node_id.clone();
+            let abi = hub.skill_abi(&req.node_id).unwrap_or_default();
+            if abi.is_empty() {
+                return (
+                    err_msg(
+                        request_id,
+                        "node_too_old",
+                        "node did not advertise a skill abi",
+                    ),
+                    Some(node_id),
+                );
+            }
+            let reply = match skill_delivery::build_desired(db, hub, &req.node_id).await {
+                Ok(desired) => skill_delivery::desired_message(&req.node_id, desired),
+                Err(err) => err_msg(request_id.clone(), "db", &format!("{err:?}")),
+            };
+            let reply = ServerMessage {
+                request_id,
+                body: reply.body,
+            };
+            (reply, Some(node_id))
+        }
+        client_message::Body::SkillState(report) => {
+            let node_id = report.node_id.clone();
+            let reply = match skill_delivery::apply_report(db, report).await {
+                Ok(()) => ServerMessage {
+                    request_id: request_id.clone(),
+                    body: Some(server_message::Body::Ack(Ack {
+                        of_request_id: request_id,
+                        ok: true,
+                        message: "ok".into(),
+                    })),
+                },
+                Err(err) => err_msg(request_id, "db", &format!("{err:?}")),
+            };
+            (reply, Some(node_id))
         }
         client_message::Body::PullConfig(req) => {
             let node_id = req.node_id.clone();
@@ -713,6 +788,7 @@ mod tests {
                 version: "test".into(),
                 bootstrap_token: String::new(),
                 labels: HashMap::new(),
+                ..Default::default()
             })),
         }
     }
@@ -733,6 +809,7 @@ mod tests {
             body: Some(client_message::Body::NodeReady(NodeReady {
                 node_id: node_id.to_string(),
                 config_generation: generation,
+                ..Default::default()
             })),
         }
     }
@@ -1021,5 +1098,109 @@ mod tests {
             !live,
             "hub send must fail while the session is bound but not ready"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_artifact_resumes_and_hides_the_ticket() {
+        let Some(srv) = running("fetch_artifact", Duration::from_secs(120)).await else {
+            return;
+        };
+        let payload: Vec<u8> = (0..300_000).map(|i| (i % 251) as u8).collect();
+        let sha = crate::artifact::sha256_hex(&payload);
+        crate::artifact::ArtifactStore::put(&srv.db, &sha, &payload)
+            .await
+            .expect("put artifact");
+        let ticket = srv.hub.issue_ticket(&srv.node_id, &sha);
+        let logs = capture_logs();
+        logs.lock().unwrap().clear();
+        let mut client = ControlClient::connect(format!("http://{}", srv.addr))
+            .await
+            .expect("client");
+        let bad_ticket = "not-a-real-fetch-ticket";
+        let err = client
+            .fetch_artifact(novbot_proto::FetchArtifactRequest {
+                node_id: srv.node_id.clone(),
+                sha256: sha.clone(),
+                fetch_ticket: bad_ticket.into(),
+                offset: 0,
+            })
+            .await
+            .expect_err("bad ticket");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        let status_text = err.to_string();
+        assert!(!status_text.contains(bad_ticket));
+        assert!(!status_text.contains(&ticket));
+        let captured = logs.lock().unwrap().clone();
+        assert!(!captured.contains(&ticket), "{captured}");
+        assert!(!captured.contains(bad_ticket), "{captured}");
+
+        let full = read_artifact(&mut client, &srv.node_id, &sha, &ticket, 0).await;
+        assert_eq!(crate::artifact::sha256_hex(&full), sha);
+        let offset = 100_000i64;
+        let tail = read_artifact(&mut client, &srv.node_id, &sha, &ticket, offset).await;
+        let mut joined = full[..offset as usize].to_vec();
+        joined.extend_from_slice(&tail);
+        assert_eq!(joined, payload);
+        assert_eq!(crate::artifact::sha256_hex(&joined), sha);
+    }
+
+    async fn read_artifact(
+        client: &mut ControlClient<tonic::transport::Channel>,
+        node_id: &str,
+        sha: &str,
+        ticket: &str,
+        offset: i64,
+    ) -> Vec<u8> {
+        let response = client
+            .fetch_artifact(novbot_proto::FetchArtifactRequest {
+                node_id: node_id.to_string(),
+                sha256: sha.to_string(),
+                fetch_ticket: ticket.to_string(),
+                offset,
+            })
+            .await
+            .expect("fetch")
+            .into_inner();
+        let mut out = Vec::new();
+        let mut stream = response;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("chunk");
+            assert_eq!(chunk.offset, offset + out.len() as i64);
+            assert_eq!(chunk.total_size, 300_000);
+            out.extend_from_slice(&chunk.data);
+        }
+        out
+    }
+
+    fn capture_logs() -> std::sync::Arc<std::sync::Mutex<String>> {
+        static LOGS: OnceLock<std::sync::Arc<std::sync::Mutex<String>>> = OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let sink = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(move || LogSink(sink.clone()))
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            logs
+        })
+        .clone()
+    }
+
+    struct LogSink(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }
