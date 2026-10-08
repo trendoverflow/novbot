@@ -1,0 +1,69 @@
+package novbot:skill@1.0.0;
+
+interface types {
+    record denial {
+        capability: string,
+        target: string,
+        reason: string,
+    }
+
+    variant host-error {
+        denied(denial),
+        not-found(string),
+        io(string),
+        limit-exceeded(string),
+        invalid(string),
+    }
+}
+
+interface fs {
+    use types.{host-error};
+
+    record file-stat {
+        exists: bool,
+        kind: string,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        size: u64,
+        mtime-unix-ms: s64,
+    }
+
+    read: func(path: string, max-bytes: u32) -> result<list<u8>, host-error>;
+    stat: func(path: string) -> result<file-stat, host-error>;
+    // `list` is a WIT keyword; `%list` is the same function name.
+    %list: func(dir: string, max-depth: u8, max-entries: u32) -> result<list<string>, host-error>;
+}
+
+interface net {
+    use types.{host-error};
+
+    record listen-socket {
+        proto: string,
+        addr: string,
+        port: u16,
+        uid: u32,
+    }
+
+    listening-ports: func() -> result<list<listen-socket>, host-error>;
+}
+
+interface sys {
+    use types.{host-error};
+
+    info: func() -> result<string, host-error>;
+    time-sync: func() -> result<string, host-error>;
+    env-get: func(key: string) -> result<option<string>, host-error>;
+}
+
+interface log {
+    log: func(level: u8, message: string);
+}
+
+world skill {
+    import fs;
+    import net;
+    import sys;
+    import log;
+    export run: func(params-json: string) -> result<string, string>;
+}
