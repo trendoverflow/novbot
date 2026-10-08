@@ -3,13 +3,11 @@
 
 //! D10.4 and D10.8 on one in-process node. Not the three-node lifecycle.
 
-#[path = "../../novbot-node/src/hub_pack.rs"]
-mod hub_pack;
-
 use crate::db;
 use crate::grpc::ControlSvc;
 use crate::http::{router, AppState};
 use crate::hub::Hub;
+use crate::hub_pack;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use novbot_core::{ProbePolicy, Spec, SpecKind};

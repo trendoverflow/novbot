@@ -20,6 +20,15 @@ pub fn os_release_package() -> Vec<u8> {
     pack_example("os-release-check", false)
 }
 
+/// Packed `examples/os-release-check-1.1.0`. The skill name stays `os-release-check`.
+///
+/// Other includers of this file do not call it. `dead_code` stays allowed so
+/// those copies still compile under `-D warnings`.
+#[allow(dead_code)]
+pub fn os_release_110_package() -> Vec<u8> {
+    pack_example("os-release-check-1.1.0", false)
+}
+
 pub fn cap_violation_package() -> Vec<u8> {
     pack_example("cap-violation-test", false)
 }
