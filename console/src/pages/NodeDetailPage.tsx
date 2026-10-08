@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
-import { NavLink, Outlet, useParams } from 'react-router-dom'
+import { Link, NavLink, Outlet, useParams } from 'react-router-dom'
 import {
   api,
   formatTime,
@@ -36,6 +36,9 @@ export function NodeDetailPage() {
       <nav className="tabs">
         <NavLink to="inventory" className={tabClass}>
           Inventory
+        </NavLink>
+        <NavLink to="skills" className={tabClass}>
+          Skills
         </NavLink>
         <NavLink to="config" className={tabClass}>
           Config
@@ -125,6 +128,77 @@ export function NodeInventoryTab() {
       </dl>
     </div>
   )
+}
+
+export function NodeSkillsTab() {
+  const { nodeId = '' } = useParams()
+  const state = useAsync(() => api.getNodeSkills(nodeId), [nodeId])
+
+  if (state.status === 'loading') return <Loading />
+  if (state.status === 'error') return <ErrorBanner error={state.error} />
+
+  const body = state.data
+  return (
+    <div>
+      <div className="tab-head">
+        <h2 className="tab-title">Skills</h2>
+        <Button variant="ghost" onClick={state.reload}>
+          Refresh
+        </Button>
+      </div>
+      <p className="muted small">
+        <code>GET /v1/nodes/{nodeId}/skills</code>
+      </p>
+      <dl className="kv">
+        <dt>Generation</dt>
+        <dd className="mono">{body.generation}</dd>
+        <dt>Applied generation</dt>
+        <dd className="mono">{body.applied_generation}</dd>
+      </dl>
+      {body.items.length === 0 ? (
+        <EmptyState>No skills reported for this node.</EmptyState>
+      ) : (
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Source</th>
+                <th>State</th>
+                <th>Desired version</th>
+                <th>Actual version</th>
+              </tr>
+            </thead>
+            <tbody>
+              {body.items.map((item) => (
+                <tr key={`${item.source}:${item.name}`}>
+                  <td>
+                    <Link to={`/skills/${encodeURIComponent(item.name)}`}>
+                      {item.name}
+                    </Link>
+                  </td>
+                  <td>{item.source}</td>
+                  <td>
+                    <span className={skillStateClass(item.state)}>{item.state}</span>
+                  </td>
+                  <td className="mono">{item.desired_version || '—'}</td>
+                  <td className="mono">{item.actual_version || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function skillStateClass(state: string): string {
+  if (state === 'installed') return 'pill pill-ok'
+  if (state === 'failed') return 'pill pill-err'
+  if (state === 'queued') return 'pill pill-queued'
+  if (state === 'pending') return 'pill pill-pending'
+  return 'pill pill-neutral'
 }
 
 export function NodeConfigTab() {

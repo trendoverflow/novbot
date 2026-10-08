@@ -9,9 +9,12 @@ import {
   NodeInventoryTab,
   NodeResultsTab,
   NodeSchedulesTab,
+  NodeSkillsTab,
 } from './pages/NodeDetailPage'
 import { ResultsPage } from './pages/ResultsPage'
 import { FleetSkillGroupsPage } from './pages/FleetSkillGroupsPage'
+import { SkillDetailPage } from './pages/SkillDetailPage'
+import { SkillsListPage } from './pages/SkillsListPage'
 import {
   SettingsApiPage,
   SettingsIndexRedirect,
@@ -27,12 +30,15 @@ export default function App() {
         <Route path="nodes/:nodeId" element={<NodeDetailPage />}>
           <Route index element={<Navigate to="inventory" replace />} />
           <Route path="inventory" element={<NodeInventoryTab />} />
+          <Route path="skills" element={<NodeSkillsTab />} />
           <Route path="config" element={<NodeConfigTab />} />
           <Route path="schedules" element={<NodeSchedulesTab />} />
           <Route path="dispatch" element={<NodeDispatchTab />} />
           <Route path="results" element={<NodeResultsTab />} />
         </Route>
         <Route path="results" element={<ResultsPage />} />
+        <Route path="skills" element={<SkillsListPage />} />
+        <Route path="skills/:name" element={<SkillDetailPage />} />
         <Route path="fleet/skill-groups" element={<FleetSkillGroupsPage />} />
         <Route path="settings" element={<SettingsLayout />}>
           <Route index element={<SettingsIndexRedirect />} />
