@@ -51,10 +51,14 @@ const SPEC_ID: &str = "os-release";
 static SUITE_MARK: Mutex<String> = Mutex::new(String::new());
 
 #[tokio::test]
+#[cfg_attr(
+    novbot_test_db_missing,
+    ignore = "NOVBOT_TEST_DATABASE_URL is unset or empty"
+)]
 async fn three_node_lifecycle_covers_install_through_reboot() {
-    let Some(db) = db::connect_test_db().await else {
-        return;
-    };
+    let db = db::connect_test_db()
+        .await
+        .expect("NOVBOT_TEST_DATABASE_URL");
     *SUITE_MARK.lock().expect("suite mark") = uuid::Uuid::new_v4().simple().to_string();
     let release = prepare_os_release();
     let _clear_fixture = ClearOsReleaseFixture;
@@ -647,8 +651,8 @@ async fn three_node_lifecycle_covers_install_through_reboot() {
     assert_ne!(map1, map3);
     assert_ne!(map2, map3);
 
-    // D10.10: drop every session, change one desired set, restart all three.
-    let fetch_arm1 = fetch_count(&nodes[0], &sha_v1);
+    // D10.10: restart while these three desired sets are still in place.
+    // orb-arm-1 is os-release-check 1.0.0, orb-arm-2 is 1.1.0, orb-arm-3 is empty.
     for node in &mut nodes {
         drop_session(node);
     }
@@ -656,6 +660,42 @@ async fn three_node_lifecycle_covers_install_through_reboot() {
         wait_disconnected(&hub, id).await;
         assert!(!hub.is_connected(id));
     }
+    assert_eq!(desired_map(&db, ARM1).await, map1);
+    assert_eq!(desired_map(&db, ARM2).await, map2);
+    assert_eq!(desired_map(&db, ARM3).await, map3);
+
+    for node in &mut nodes {
+        reopen(node, &endpoint).await;
+        assert_eq!(wasm(node.host()), 0);
+        boot(node, &endpoint, &hub).await;
+        assert_eq!(wasm(node.host()), 0, "restart reconcile must not run wasm");
+        assert_converged(&db, node).await;
+    }
+    assert_eq!(desired_map(&db, ARM1).await, map1);
+    assert_eq!(desired_map(&db, ARM2).await, map2);
+    assert_eq!(desired_map(&db, ARM3).await, map3);
+    assert_eq!(
+        nodes[0].host().active_version(SKILL).as_deref(),
+        Some("1.0.0")
+    );
+    assert_eq!(
+        nodes[1].host().active_version(SKILL).as_deref(),
+        Some("1.1.0")
+    );
+    assert!(nodes[2].host().active_version(SKILL).is_none());
+    assert_installed_version(&app, ARM1, "1.0.0").await;
+    assert_installed_version(&app, ARM2, "1.1.0").await;
+    assert_skill_absent(&app, ARM3).await;
+    assert!(hub.is_connected(ARM1));
+    assert!(hub.is_connected(ARM2));
+    assert!(hub.is_connected(ARM3));
+
+    // Later step: while one node is down, remove the skill from its desired set.
+    let fetch_arm1 = fetch_count(&nodes[0], &sha_v1);
+    let wasm_arm1 = wasm(nodes[0].host());
+    drop_session(&mut nodes[0]);
+    wait_disconnected(&hub, ARM1).await;
+    assert!(!hub.is_connected(ARM1));
     let removed_offline = post_json(
         &app,
         &format!("/v1/skills/{SKILL}/uninstall"),
@@ -669,31 +709,40 @@ async fn three_node_lifecycle_covers_install_through_reboot() {
     );
     assert!(desired_of(&db, ARM1).await.is_none());
     assert_eq!(fetch_count(&nodes[0], &sha_v1), fetch_arm1);
+    assert_eq!(wasm(nodes[0].host()), wasm_arm1);
     assert_eq!(
         nodes[0].host().active_version(SKILL).as_deref(),
         Some("1.0.0")
     );
-    assert_eq!(desired_version(&db, ARM2).await.as_deref(), Some("1.1.0"));
-    assert!(desired_of(&db, ARM3).await.is_none());
+    assert_eq!(desired_map(&db, ARM2).await, map2);
+    assert_eq!(desired_map(&db, ARM3).await, map3);
 
-    for node in &mut nodes {
-        reopen(node, &endpoint).await;
-        assert_eq!(wasm(node.host()), 0);
-        boot(node, &endpoint, &hub).await;
-        assert_eq!(wasm(node.host()), 0, "restart reconcile must not run wasm");
-        assert_converged(&db, node).await;
-    }
+    reopen(&mut nodes[0], &endpoint).await;
+    assert_eq!(wasm(nodes[0].host()), 0);
+    boot(&mut nodes[0], &endpoint, &hub).await;
+    assert_eq!(
+        wasm(nodes[0].host()),
+        0,
+        "restart reconcile must not run wasm"
+    );
+    assert_converged(&db, &nodes[0]).await;
     assert!(nodes[0].host().active_version(SKILL).is_none());
+    assert!(nodes[0]
+        .host()
+        .snapshot()
+        .skills
+        .iter()
+        .all(|skill| skill.name != SKILL));
     assert!(!desired_map(&db, ARM1).await.contains_key(SKILL));
     assert!(!actual_map(&db, ARM1).await.contains_key(SKILL));
     assert_skill_absent(&app, ARM1).await;
+    assert_eq!(desired_map(&db, ARM2).await, map2);
+    assert_eq!(desired_map(&db, ARM3).await, map3);
     assert_eq!(
         nodes[1].host().active_version(SKILL).as_deref(),
         Some("1.1.0")
     );
-    assert_installed_version(&app, ARM2, "1.1.0").await;
     assert!(nodes[2].host().active_version(SKILL).is_none());
-    assert_skill_absent(&app, ARM3).await;
     assert!(hub.is_connected(ARM1));
     assert!(hub.is_connected(ARM2));
     assert!(hub.is_connected(ARM3));
