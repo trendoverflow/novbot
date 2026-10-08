@@ -35,14 +35,14 @@ const RESP_LIMIT: usize = 8 * 1024 * 1024;
 
 #[tokio::test]
 async fn installed_skill_dispatch_is_ok_and_audits_denials() {
-    if hub_pack::relaunch_if_os_release_missing(
-        "d10_execute::installed_skill_dispatch_is_ok_and_audits_denials",
-    ) {
-        return;
-    }
     let Some(db) = db::connect_test_db().await else {
         return;
     };
+    let release = hub_pack::prepare_os_release();
+    if let Some(path) = release.fixture.clone() {
+        novbot_node::set_missing_os_release_fixture(Some(path));
+    }
+    let _clear_fixture = ClearOsReleaseFixture;
     let pid = std::process::id();
     let node_id = format!("d10-exec-{}", uuid::Uuid::new_v4());
     let hub = Hub::new();
@@ -171,9 +171,8 @@ async fn installed_skill_dispatch_is_ok_and_audits_denials() {
     );
     assert_eq!(host.wasm_run_entries(), 0, "install must not execute");
 
-    let release = hub_pack::host_os_release();
-    let want_id = hub_pack::os_field(&release, "ID");
-    let want_version = hub_pack::os_field(&release, "VERSION_ID");
+    let want_id = hub_pack::os_field(&release.text, "ID");
+    let want_version = hub_pack::os_field(&release.text, "VERSION_ID");
     let os = dispatch_run(
         &app,
         &mut inbound,
@@ -368,6 +367,14 @@ async fn dispatch_run(
     send_result(tx, node_id, &run_id, spec_id, &status, &payload_json).await;
     assert_report_accepted(inbound).await;
     (status, payload, run_id)
+}
+
+struct ClearOsReleaseFixture;
+
+impl Drop for ClearOsReleaseFixture {
+    fn drop(&mut self) {
+        novbot_node::set_missing_os_release_fixture(None);
+    }
 }
 
 fn spec_by_id(id: &str) -> Spec {

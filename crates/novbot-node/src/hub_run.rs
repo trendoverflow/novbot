@@ -300,23 +300,28 @@ async fn stored_timeout_and_permit_gate_the_wasm_run() {
 
 #[tokio::test]
 async fn installed_examples_report_ok_and_denials() {
-    if hub_pack::relaunch_if_os_release_missing("hub_run::installed_examples_report_ok_and_denials")
-    {
-        return;
+    let release = hub_pack::prepare_os_release();
+    if let Some(path) = release.fixture.clone() {
+        novbot_skill_runtime::set_missing_os_release_fixture(Some(path));
     }
+    let _clear_fixture = ClearOsReleaseFixture;
     let packages = vec![
         hub_pack::os_release_package(),
         hub_pack::cap_violation_package(),
         hub_pack::cap_policy_package(),
     ];
     let (dir, host) = install(&packages, 1).await;
-    let release = hub_pack::host_os_release();
-    let want_id = hub_pack::os_field(&release, "ID");
-    let want_version = hub_pack::os_field(&release, "VERSION_ID");
-    assert!(!want_id.is_empty(), "os-release ID is empty: {release}");
+    let want_id = hub_pack::os_field(&release.text, "ID");
+    let want_version = hub_pack::os_field(&release.text, "VERSION_ID");
+    assert!(
+        !want_id.is_empty(),
+        "os-release ID is empty: {}",
+        release.text
+    );
     assert!(
         !want_version.is_empty(),
-        "os-release VERSION_ID is empty: {release}"
+        "os-release VERSION_ID is empty: {}",
+        release.text
     );
 
     let permit = host.try_acquire_run().expect("slot");
@@ -409,6 +414,14 @@ async fn installed_examples_report_ok_and_denials() {
     assert_eq!(again.0, "ok", "{again:?}");
     assert_eq!(again.1["ID"], want_id);
     assert_eq!(host.wasm_run_entries(), 5);
+}
+
+struct ClearOsReleaseFixture;
+
+impl Drop for ClearOsReleaseFixture {
+    fn drop(&mut self) {
+        novbot_skill_runtime::set_missing_os_release_fixture(None);
+    }
 }
 
 async fn run_os(host: &SkillHost, data: &Path, version: &str) -> (String, Value) {

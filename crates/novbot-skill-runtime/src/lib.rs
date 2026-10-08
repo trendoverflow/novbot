@@ -14,7 +14,7 @@ mod host;
 mod wasi_deny;
 
 pub use grant::{CapabilityDef, DenialReason, ScopeRequirement, CAPABILITIES};
-pub use host::{run, RunRequest, SkillRuntime};
+pub use host::{run, set_missing_os_release_fixture, RunRequest, SkillRuntime};
 
 use serde::Serialize;
 

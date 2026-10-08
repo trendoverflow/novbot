@@ -28,57 +28,30 @@ pub fn cap_policy_package() -> Vec<u8> {
     pack_example("cap-violation-test", true)
 }
 
-/// Re-exec this test when `/etc/os-release` is missing so `open` of that path
-/// reads a fixture. Returns true when this process already relaunched and the
-/// caller should return.
-pub fn relaunch_if_os_release_missing(test_name: &str) -> bool {
-    if fs::metadata("/etc/os-release").is_ok() || fs::metadata("/private/etc/os-release").is_ok() {
-        return false;
-    }
-    if std::env::var_os("NOVBOT_OS_RELEASE_CHILD").is_some() {
-        return false;
-    }
-    let fixture =
-        std::env::temp_dir().join(format!("novbot-os-release-{}.txt", std::process::id()));
-    fs::write(
-        &fixture,
-        "ID=novbot\nVERSION_ID=\"26.6\"\nNAME=\"NovBot Test\"\n",
-    )
-    .expect("write os-release fixture");
-    let dylib =
-        std::env::temp_dir().join(format!("novbot-os-interpose-{}.dylib", std::process::id()));
-    let source = std::env::temp_dir().join(format!("novbot-os-interpose-{}.c", std::process::id()));
-    fs::write(&source, INTERPOSE_C).expect("write interpose source");
-    let compiled = Command::new("cc")
-        .args(["-dynamiclib", "-o"])
-        .arg(&dylib)
-        .arg(&source)
-        .output()
-        .expect("spawn cc");
-    assert!(
-        compiled.status.success(),
-        "cc interpose failed\n{}",
-        String::from_utf8_lossy(&compiled.stderr)
-    );
-    let exe = std::env::current_exe().expect("current exe");
-    let status = Command::new(exe)
-        .args(["--exact", test_name, "--test-threads", "1"])
-        .env("NOVBOT_OS_RELEASE_CHILD", "1")
-        .env("NOVBOT_OS_RELEASE_FILE", &fixture)
-        .env("DYLD_INSERT_LIBRARIES", &dylib)
-        .status()
-        .expect("relaunch test");
-    let _ = fs::remove_file(&fixture);
-    let _ = fs::remove_file(&dylib);
-    let _ = fs::remove_file(&source);
-    assert!(status.success(), "os-release child test failed: {status}");
-    true
+/// Text `os-release-check` should report, plus a temp fixture when the host
+/// has no `/etc/os-release`. The caller installs `fixture` on the runtime.
+pub struct OsReleaseFile {
+    pub text: String,
+    pub fixture: Option<PathBuf>,
 }
 
-pub fn host_os_release() -> String {
-    fs::read_to_string("/etc/os-release")
-        .or_else(|_| fs::read_to_string("/private/etc/os-release"))
-        .expect("read /etc/os-release")
+pub fn prepare_os_release() -> OsReleaseFile {
+    for path in ["/etc/os-release", "/private/etc/os-release"] {
+        if fs::metadata(path).is_ok() {
+            let text = fs::read_to_string(path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+            return OsReleaseFile {
+                text,
+                fixture: None,
+            };
+        }
+    }
+    let path = std::env::temp_dir().join(format!("novbot-os-release-{}.txt", std::process::id()));
+    let text = "ID=novbot\nVERSION_ID=\"26.6\"\nNAME=\"NovBot Test\"\n";
+    fs::write(&path, text).expect("write os-release fixture");
+    OsReleaseFile {
+        text: text.to_string(),
+        fixture: Some(path),
+    }
 }
 
 pub fn os_field(text: &str, key: &str) -> String {
@@ -194,28 +167,12 @@ fn build_package(workspace: &Path, source: &Path, policy_shadow: bool) -> Vec<u8
 }
 
 fn skill_cli(workspace: &Path) -> PathBuf {
-    use std::sync::OnceLock;
-    static CLI: OnceLock<PathBuf> = OnceLock::new();
-    CLI.get_or_init(|| {
-        if let Some(bin) = existing_skill_cli(workspace) {
-            return bin;
-        }
-        // Separate target dir: a nested cargo build on the workspace target
-        // deadlocks behind the cargo test that is running this process.
-        let target = PathBuf::from("/tmp/novbot-sh6-cli-target");
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "novbot-skill", "--bin", "novbot-skill"])
-            .current_dir(workspace)
-            .env("CARGO_TARGET_DIR", &target)
-            .env("CARGO_INCREMENTAL", "0")
-            .status()
-            .expect("spawn cargo");
-        assert!(status.success(), "cargo build -p novbot-skill failed");
-        let bin = target.join("debug/novbot-skill");
-        assert!(bin.is_file(), "missing {}", bin.display());
-        bin
+    existing_skill_cli(workspace).unwrap_or_else(|| {
+        panic!(
+            "missing {} — build it with cargo build -p novbot-skill --bin novbot-skill",
+            workspace.join("target/debug/novbot-skill").display()
+        )
     })
-    .clone()
 }
 
 fn existing_skill_cli(workspace: &Path) -> Option<PathBuf> {
@@ -389,69 +346,3 @@ fn tempfile_dir() -> PathBuf {
     fs::create_dir_all(&path).expect("temp project");
     path
 }
-
-const INTERPOSE_C: &str = r#"
-#define _DARWIN_C_SOURCE
-#include <fcntl.h>
-#include <stdarg.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-
-static const char *subst(const char *path) {
-    if (path == NULL) {
-        return path;
-    }
-    if (strcmp(path, "/etc/os-release") != 0 && strcmp(path, "/private/etc/os-release") != 0) {
-        return path;
-    }
-    const char *fix = getenv("NOVBOT_OS_RELEASE_FILE");
-    if (fix == NULL || fix[0] == '\0') {
-        return path;
-    }
-    return fix;
-}
-
-static int raw_open(const char *path, int oflag, mode_t mode) {
-    return (int)syscall(SYS_open, path, oflag, mode);
-}
-
-static int raw_openat(int fd, const char *path, int oflag, mode_t mode) {
-    return (int)syscall(SYS_openat, fd, path, oflag, mode);
-}
-
-static int hooked_open(const char *path, int oflag, ...) {
-    mode_t mode = 0;
-    if (oflag & O_CREAT) {
-        va_list ap;
-        va_start(ap, oflag);
-        mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-    }
-    return raw_open(subst(path), oflag, mode);
-}
-
-static int hooked_openat(int fd, const char *path, int oflag, ...) {
-    mode_t mode = 0;
-    if (oflag & O_CREAT) {
-        va_list ap;
-        va_start(ap, oflag);
-        mode = (mode_t)va_arg(ap, int);
-        va_end(ap);
-    }
-    const char *use = path;
-    if (path != NULL && path[0] == '/') {
-        use = subst(path);
-    }
-    return raw_openat(fd, use, oflag, mode);
-}
-
-#define DYLD_INTERPOSE(_repl, _orig) \
-    __attribute__((used)) static struct { const void *replacement; const void *replacee; } \
-    _dyld_interpose_##_orig __attribute__((section("__DATA,__interpose"))) = { \
-        (const void *)(unsigned long)&_repl, (const void *)(unsigned long)&_orig };
-
-DYLD_INTERPOSE(hooked_open, open)
-DYLD_INTERPOSE(hooked_openat, openat)
-"#;
