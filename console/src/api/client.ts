@@ -213,6 +213,133 @@ export type CreateTokenResponse = {
   note?: string
 }
 
+/** One declared grant on a Hub skill version. */
+export type SkillCapability = {
+  grant: string
+  name: string
+  scope: string | null
+  risk: string
+  description: string
+  reason: string | null
+}
+
+/** `items[]` on GET /v1/skills. Built-ins have an empty latest_version. */
+export type HubSkillItem = {
+  name: string
+  source: string
+  display_name: string
+  description: string
+  latest_version: string
+  sha256: string
+  capabilities: SkillCapability[]
+}
+
+export type SkillsListResponse = {
+  skills: string[]
+  items: HubSkillItem[]
+  next_page_token: string | null
+  note?: string
+}
+
+export type SkillVersionSummary = {
+  version: string
+  sha256: string
+  signature_status: string
+  status: string
+}
+
+export type SkillDetail = {
+  name: string
+  source: string
+  display_name: string
+  description: string
+  publisher: string | null
+  latest_version: string | null
+  sha256: string | null
+  capabilities: SkillCapability[]
+  versions: SkillVersionSummary[]
+}
+
+export type SkillVersionDetail = {
+  name: string
+  version: string
+  sha256: string
+  size_bytes: number
+  content_type: string
+  abi: string
+  signature_status: string
+  status: string
+  capabilities: SkillCapability[]
+  capabilities_sha256: string
+  lint_warnings: string[]
+  display_name: string
+  description: string
+  publisher: string | null
+  min_node_version: string | null
+  platforms: string[]
+}
+
+export type SkillPublishResponse = {
+  name: string
+  version: string
+  sha256: string
+  capabilities: SkillCapability[]
+  capabilities_sha256: string
+  signature_status: string
+  lint_warnings: string[]
+}
+
+/** Hand-picked nodes plus an optional label map. Never a tags field. */
+export type SkillSelector = {
+  labels: Record<string, string>
+}
+
+export type InstallSkillBody = {
+  version: string
+  node_ids: string[]
+  selector?: SkillSelector
+  accepted_capabilities_sha256: string
+}
+
+export type RollbackSkillBody = {
+  node_ids: string[]
+  selector?: SkillSelector
+  to_version?: string
+}
+
+export type UninstallSkillBody = {
+  node_ids: string[]
+  selector?: SkillSelector
+  force: boolean
+}
+
+export type PerNodeOutcome = {
+  node_id: string
+  outcome: string
+  generation: number
+}
+
+export type SkillChangeResponse = {
+  operation_id: string | null
+  dry_run: boolean
+  per_node: PerNodeOutcome[]
+}
+
+export type NodeSkillItem = {
+  name: string
+  source: string
+  state: string
+  desired_version: string | null
+  actual_version: string | null
+}
+
+export type NodeSkillsResponse = {
+  node_id: string
+  generation: number
+  applied_generation: number
+  items: NodeSkillItem[]
+}
+
 export const api = {
   health: () => requestHealth<HealthResponse>(),
 
@@ -267,6 +394,52 @@ export const api = {
 
   createToken: () =>
     request<CreateTokenResponse>('/tokens', { method: 'POST' }),
+
+  listSkills: () => request<SkillsListResponse>('/skills'),
+
+  getSkill: (name: string) =>
+    request<SkillDetail>(`/skills/${encodeURIComponent(name)}`),
+
+  getSkillVersion: (name: string, version: string) =>
+    request<SkillVersionDetail>(
+      `/skills/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}`,
+    ),
+
+  uploadSkill: (bytes: ArrayBuffer) =>
+    request<SkillPublishResponse>('/skills', {
+      method: 'POST',
+      body: bytes,
+      headers: { 'Content-Type': 'application/vnd.novbot.skill' },
+    }),
+
+  installSkill: (name: string, body: InstallSkillBody) =>
+    request<SkillChangeResponse>(`/skills/${encodeURIComponent(name)}/install`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  rollbackSkill: (name: string, body: RollbackSkillBody) =>
+    request<SkillChangeResponse>(
+      `/skills/${encodeURIComponent(name)}/rollback`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body),
+      },
+    ),
+
+  uninstallSkill: (name: string, body: UninstallSkillBody) =>
+    request<SkillChangeResponse>(
+      `/skills/${encodeURIComponent(name)}/uninstall`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body),
+      },
+    ),
+
+  getNodeSkills: (nodeId: string) =>
+    request<NodeSkillsResponse>(
+      `/nodes/${encodeURIComponent(nodeId)}/skills`,
+    ),
 }
 
 /** Parse specs_json / schedules_json from NodeConfig for editors. */
@@ -283,4 +456,43 @@ export function formatTime(iso: string | null | undefined): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
   return d.toLocaleString()
+}
+
+export function apiErrorCode(error: unknown): string | null {
+  if (!(error instanceof ApiError)) return null
+  const body = error.body
+  if (!body || typeof body !== 'object' || !('code' in body)) return null
+  const code = (body as { code?: unknown }).code
+  return typeof code === 'string' && code.trim() ? code : null
+}
+
+export function isCapabilitiesChanged(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    apiErrorCode(error) === 'capabilities_changed'
+  )
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === 'string')
+}
+
+/** `409 skill_in_use` carries the referencing spec and schedule ids. */
+export function skillInUseRefs(
+  error: unknown,
+): { specIds: string[]; scheduleIds: string[] } | null {
+  if (!(error instanceof ApiError) || apiErrorCode(error) !== 'skill_in_use') {
+    return null
+  }
+  const body = error.body
+  if (!body || typeof body !== 'object') {
+    return { specIds: [], scheduleIds: [] }
+  }
+  const record = body as { spec_ids?: unknown; schedule_ids?: unknown }
+  return {
+    specIds: stringList(record.spec_ids),
+    scheduleIds: stringList(record.schedule_ids),
+  }
 }

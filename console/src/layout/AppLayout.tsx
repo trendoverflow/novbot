@@ -44,6 +44,9 @@ export function AppLayout() {
           <NavLink to="/results" className={navClass}>
             Results
           </NavLink>
+          <NavLink to="/skills" className={navClass}>
+            Skills Hub
+          </NavLink>
           <NavLink to="/fleet/skill-groups" className={navClass}>
             Fleet
           </NavLink>
