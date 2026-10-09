@@ -19,6 +19,7 @@ pub const ENTRY_MAX: usize = 256;
 pub const WASM_MAX: u64 = 12 * 1024 * 1024;
 pub const ABI: &str = "novbot:skill@1";
 
+/// Install catalog for this node. `proc.cmdline.read` is not included.
 pub const CATALOG: &[&str] = &[
     "fs.read",
     "fs.stat",
@@ -27,6 +28,9 @@ pub const CATALOG: &[&str] = &[
     "sys.info.read",
     "sys.time_sync.read",
     "env.read",
+    "sys.metrics.read",
+    "proc.list.read",
+    "net.interfaces.read",
 ];
 
 #[derive(Debug, Clone)]
@@ -503,4 +507,18 @@ fn toml_string(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CATALOG;
+
+    #[test]
+    fn observability_names_are_in_the_node_catalog() {
+        assert!(CATALOG.contains(&"sys.metrics.read"));
+        assert!(CATALOG.contains(&"proc.list.read"));
+        assert!(CATALOG.contains(&"net.interfaces.read"));
+        assert!(!CATALOG.contains(&"proc.cmdline.read"));
+        assert!(!CATALOG.contains(&"net.connections.read"));
+    }
 }

@@ -22,6 +22,9 @@ pub struct MockHost {
     pub ports: Vec<ListenSocket>,
     pub info: String,
     pub time_sync: String,
+    pub metrics: String,
+    pub processes: String,
+    pub interfaces: String,
     pub env: BTreeMap<String, String>,
     pub logs: Vec<(u8, String)>,
     pub calls: Vec<String>,
@@ -36,6 +39,9 @@ impl Default for MockHost {
             ports: Vec::new(),
             info: r#"{"hostname":"mock-host"}"#.to_string(),
             time_sync: r#"{"synced":false,"source":null,"offset_ms":null}"#.to_string(),
+            metrics: r#"{"cpu":{"usage_percent":0,"load_avg_1m":null,"load_avg_5m":null,"load_avg_15m":null},"memory":{},"disks":[],"disk_io":[]}"#.to_string(),
+            processes: r#"{"processes":[]}"#.to_string(),
+            interfaces: r#"{"interfaces":[]}"#.to_string(),
             env: BTreeMap::new(),
             logs: Vec::new(),
             calls: Vec::new(),
@@ -142,6 +148,11 @@ impl MockHost {
         Ok(self.ports.clone())
     }
 
+    pub(crate) fn interfaces(&mut self) -> Result<String, HostError> {
+        self.calls.push("net.interfaces".to_string());
+        self.bare("net.interfaces.read", self.interfaces.clone())
+    }
+
     pub(crate) fn info(&mut self) -> Result<String, HostError> {
         self.calls.push("sys.info".to_string());
         self.bare("sys.info.read", self.info.clone())
@@ -150,6 +161,16 @@ impl MockHost {
     pub(crate) fn time_sync(&mut self) -> Result<String, HostError> {
         self.calls.push("sys.time_sync".to_string());
         self.bare("sys.time_sync.read", self.time_sync.clone())
+    }
+
+    pub(crate) fn metrics(&mut self) -> Result<String, HostError> {
+        self.calls.push("sys.metrics".to_string());
+        self.bare("sys.metrics.read", self.metrics.clone())
+    }
+
+    pub(crate) fn processes(&mut self) -> Result<String, HostError> {
+        self.calls.push("proc.processes".to_string());
+        self.bare("proc.list.read", self.processes.clone())
     }
 
     pub(crate) fn env_get(&mut self, key: &str) -> Result<Option<String>, HostError> {

@@ -62,6 +62,17 @@ pub mod net {
             crate::testing::call(|host| host.listening_ports())
         }
     }
+
+    pub fn interfaces() -> Result<String, HostError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest_bind::novbot::skill::net::interfaces().map_err(HostError::from);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::testing::call(|host| host.interfaces())
+        }
+    }
 }
 
 pub mod sys {
@@ -86,6 +97,32 @@ pub mod sys {
         #[cfg(not(target_arch = "wasm32"))]
         {
             crate::testing::call(|host| host.time_sync())
+        }
+    }
+
+    pub fn metrics() -> Result<String, HostError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest_bind::novbot::skill::sys::metrics().map_err(HostError::from);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::testing::call(|host| host.metrics())
+        }
+    }
+}
+
+pub mod proc {
+    use crate::HostError;
+
+    pub fn processes() -> Result<String, HostError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest_bind::novbot::skill::proc::processes().map_err(HostError::from);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::testing::call(|host| host.processes())
         }
     }
 }

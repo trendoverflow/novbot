@@ -644,6 +644,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builtin_cpu_memory_and_disk_root_still_run() {
+        let policy = ProbePolicy::default();
+        let specs = [
+            Spec {
+                id: "cpu".into(),
+                kind: SpecKind::Cpu,
+                params: json!({}),
+                threshold: None,
+            },
+            Spec {
+                id: "memory".into(),
+                kind: SpecKind::Memory,
+                params: json!({}),
+                threshold: None,
+            },
+            Spec {
+                id: "disk-root".into(),
+                kind: SpecKind::Disk,
+                params: json!({"mount": "/"}),
+                threshold: None,
+            },
+        ];
+        for spec in specs {
+            let out = run_probe(&spec, &policy).await.unwrap();
+            assert_eq!(out.status, "ok", "{}", spec.id);
+            assert!(out.payload.is_object(), "{}", spec.id);
+        }
+    }
+
+    #[tokio::test]
     async fn compliance_path_root() {
         let spec = Spec {
             id: "root-exists".into(),

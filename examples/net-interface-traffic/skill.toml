@@ -1,0 +1,19 @@
+schema_version = 1
+name = "net-interface-traffic"
+version = "1.0.0"
+display_name = "Network interface traffic"
+description = "Return per-interface byte, packet, and error counters"
+
+[runtime]
+kind = "wasm"
+abi = "novbot:skill@1"
+
+[runtime.limits]
+timeout_ms = 10000
+memory_mb = 32
+
+[files]
+
+[[capabilities]]
+name = "net.interfaces.read"
+reason = "Read per-interface counters"

@@ -46,6 +46,8 @@ interface net {
     }
 
     listening-ports: func() -> result<list<listen-socket>, host-error>;
+    // Per-interface counters. Not the connection table.
+    interfaces: func() -> result<string, host-error>;
 }
 
 interface sys {
@@ -54,6 +56,15 @@ interface sys {
     info: func() -> result<string, host-error>;
     time-sync: func() -> result<string, host-error>;
     env-get: func(key: string) -> result<option<string>, host-error>;
+    // CPU, memory, and disk aggregates. JSON object; see the host collector.
+    metrics: func() -> result<string, host-error>;
+}
+
+interface proc {
+    use types.{host-error};
+
+    // Process table without command lines. `list` is a WIT keyword.
+    processes: func() -> result<string, host-error>;
 }
 
 interface log {
@@ -64,6 +75,7 @@ world skill {
     import fs;
     import net;
     import sys;
+    import proc;
     import log;
     export run: func(params-json: string) -> result<string, string>;
 }

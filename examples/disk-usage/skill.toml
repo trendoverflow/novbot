@@ -1,0 +1,19 @@
+schema_version = 1
+name = "disk-usage"
+version = "1.0.0"
+display_name = "Disk usage"
+description = "Return per-mount disk usage from host metrics"
+
+[runtime]
+kind = "wasm"
+abi = "novbot:skill@1"
+
+[runtime.limits]
+timeout_ms = 10000
+memory_mb = 32
+
+[files]
+
+[[capabilities]]
+name = "sys.metrics.read"
+reason = "Read per-mount disk usage"

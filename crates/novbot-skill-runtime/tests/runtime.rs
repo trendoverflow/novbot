@@ -207,7 +207,7 @@ fn unknown_grant_does_not_run() {
     std::fs::write(&file, secret).unwrap();
     let grant = format!("fs.read:{}", file.display());
     let json = invoke(
-        &[&grant, "sys.metrics.read"],
+        &[&grant, "proc.cmdline.read"],
         json!({"op": "read", "path": file.display().to_string(), "max_bytes": 4096}),
         None,
     );
@@ -217,6 +217,21 @@ fn unknown_grant_does_not_run() {
     assert_eq!(json["output"], serde_json::Value::Null);
     assert_eq!(json["partial"], serde_json::Value::Null);
     assert_absent(&json, secret);
+}
+
+#[test]
+fn observability_grants_are_supported() {
+    let json = invoke(
+        &[
+            "sys.info.read",
+            "sys.metrics.read",
+            "proc.list.read",
+            "net.interfaces.read",
+        ],
+        json!({"op": "info"}),
+        None,
+    );
+    assert_eq!(json["status"], "ok", "{json}");
 }
 
 #[test]
