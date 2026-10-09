@@ -6,7 +6,9 @@ mod db;
 mod grpc;
 mod http;
 mod hub;
+mod skill_bundles;
 mod skill_catalog;
+mod skill_desired;
 
 use anyhow::Context;
 use clap::Parser;

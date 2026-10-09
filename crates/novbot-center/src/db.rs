@@ -116,6 +116,10 @@ impl Db {
                 "004_skill_catalog.sql",
                 include_str!("../migrations/004_skill_catalog.sql"),
             ),
+            (
+                "005_skills_desired.sql",
+                include_str!("../migrations/005_skills_desired.sql"),
+            ),
         ] {
             for stmt in split_sql(sql) {
                 sqlx::query(stmt)

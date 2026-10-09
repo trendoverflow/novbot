@@ -32,6 +32,7 @@ pub(crate) enum CatalogError {
     UploadsDisabled { max_allowed_packet: u64 },
     PackageTooLarge,
     InvalidArchive(String),
+    InvalidManifest(String),
     InvalidWasm(String),
     HashMismatch,
     NameReserved,
@@ -54,6 +55,7 @@ impl std::fmt::Display for CatalogError {
             }
             Self::PackageTooLarge => write!(f, "package too large"),
             Self::InvalidArchive(msg)
+            | Self::InvalidManifest(msg)
             | Self::InvalidWasm(msg)
             | Self::CapabilityUnsupported(msg)
             | Self::CapabilityInvalid(msg) => write!(f, "{msg}"),
@@ -370,6 +372,42 @@ pub(crate) async fn list_hub_items(db: &Db) -> Result<Vec<HubSkillItem>, Catalog
         .collect())
 }
 
+pub(crate) fn is_builtin_name(name: &str) -> bool {
+    novbot_core::list_skills().contains(&name)
+}
+
+pub(crate) fn builtin_list_items() -> Vec<HubSkillItem> {
+    novbot_core::list_skills()
+        .into_iter()
+        .map(|name| HubSkillItem {
+            name: name.to_string(),
+            source: "builtin".to_string(),
+            display_name: name.to_string(),
+            description: String::new(),
+            latest_version: String::new(),
+            sha256: String::new(),
+            capabilities: Vec::new(),
+        })
+        .collect()
+}
+
+pub(crate) fn builtin_detail(name: &str) -> Option<SkillDetail> {
+    if !is_builtin_name(name) {
+        return None;
+    }
+    Some(SkillDetail {
+        name: name.to_string(),
+        source: "builtin".to_string(),
+        display_name: name.to_string(),
+        description: String::new(),
+        publisher: None,
+        latest_version: None,
+        sha256: None,
+        capabilities: Vec::new(),
+        versions: Vec::new(),
+    })
+}
+
 pub(crate) async fn get_skill(db: &Db, name: &str) -> Result<SkillDetail, CatalogError> {
     let skill = load_skill(db, name).await?;
     let versions = load_versions(db, skill.id).await?;
@@ -463,7 +501,7 @@ fn parse_package(body: &[u8]) -> Result<ParsedPackage, CatalogError> {
     let output_schema_json = optional_json_text(&files, "schema/output.json")?;
 
     let manifest: ManifestToml = toml::from_str(&manifest_toml)
-        .map_err(|err| invalid_archive(format!("skill.toml: {err}")))?;
+        .map_err(|err| CatalogError::InvalidManifest(format!("skill.toml: {err}")))?;
     if manifest.schema_version != 1 {
         return Err(invalid_archive("schema_version must be 1"));
     }
@@ -1726,6 +1764,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unreadable_bytes_are_invalid_archive() {
+        assert!(matches!(
+            parse_package(b"not-an-archive").unwrap_err(),
+            CatalogError::InvalidArchive(_)
+        ));
+    }
+
+    #[test]
+    fn non_toml_skill_toml_is_invalid_manifest() {
+        let package = build_bad_toml_package();
+        assert!(matches!(
+            parse_package(&package).unwrap_err(),
+            CatalogError::InvalidManifest(_)
+        ));
+    }
+
+    fn build_bad_toml_package() -> Vec<u8> {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            append_file(&mut builder, "skill.toml", b"this is not = toml :::");
+            append_file(&mut builder, "module.wasm", b"\0asm\x01\x00\x00\x00");
+            append_file(&mut builder, "schema/params.json", PARAMS_JSON);
+            builder.finish().expect("tar finish");
+        }
+        gzip_bytes(&tar_bytes)
+    }
+
     #[tokio::test]
     async fn post_skill_lists_hub_source_and_capabilities() {
         let Some(db) = connect_test_db().await else {
@@ -1776,11 +1843,21 @@ mod tests {
         assert_eq!(item["sha256"], posted["sha256"]);
         assert_eq!(item["latest_version"], "1.0.0");
         assert_eq!(item["capabilities"], posted["capabilities"]);
-        assert!(items.iter().all(|item| item["source"] == "hub"));
-        assert!(items.iter().all(|item| {
-            let skill_name = item["name"].as_str().unwrap_or("");
-            skill_name != "host_info" && skill_name != "echo" && skill_name != "env_get"
-        }));
+        assert!(items
+            .iter()
+            .all(|item| { matches!(item["source"].as_str(), Some("hub") | Some("builtin")) }));
+        for builtin in ["host_info", "echo", "env_get"] {
+            let item = items
+                .iter()
+                .find(|item| item["name"] == builtin)
+                .unwrap_or_else(|| panic!("missing builtin {builtin}"));
+            assert_eq!(item["source"], "builtin");
+            assert_eq!(item["display_name"], builtin);
+            assert_eq!(item["description"], "");
+            assert_eq!(item["latest_version"], "");
+            assert_eq!(item["sha256"], "");
+            assert_eq!(item["capabilities"], serde_json::json!([]));
+        }
 
         let (status, bytes) = oneshot(&db, get_req(&format!("/v1/skills/{name}"))).await;
         assert_eq!(
@@ -2006,6 +2083,42 @@ mod tests {
             .await,
             0
         );
+        assert!(artifact_bytes(&db, &sha).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn post_unreadable_package_is_invalid_archive() {
+        let Some(db) = connect_test_db().await else {
+            return;
+        };
+        let body = b"not-an-archive".to_vec();
+        let sha = sha256_hex(&body);
+        let (status, bytes) = oneshot(&db, post_package(body, None)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(json_body(&bytes)["code"], "invalid_archive");
+        assert!(artifact_bytes(&db, &sha).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn post_skill_toml_parse_failure_is_invalid_manifest() {
+        let Some(db) = connect_test_db().await else {
+            return;
+        };
+        let package = build_bad_toml_package();
+        let sha = sha256_hex(&package);
+        let (status, bytes) = oneshot(&db, post_package(package, None)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(json_body(&bytes)["code"], "invalid_manifest");
         assert!(artifact_bytes(&db, &sha).await.is_none());
     }
 
