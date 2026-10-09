@@ -29,7 +29,23 @@ pub struct ProbeOutcome {
     pub payload: Value,
 }
 
-pub async fn run_probe(spec: &Spec) -> Result<ProbeOutcome, ProbeError> {
+/// Node-local probe policy. Fixed at process start.
+///
+/// Spec params, the config file, and the center cannot change `allow_exec`.
+/// `Default` leaves exec disabled (`bool` defaults to false).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProbePolicy {
+    pub allow_exec: bool,
+}
+
+/// `payload.reason` when an exec Spec is refused because the node policy disables it.
+pub const EXEC_DISABLED_REASON: &str = "exec_disabled";
+
+/// Run one spec under `policy`.
+///
+/// `SpecKind::Exec` spawns a shell only when `policy.allow_exec` is true.
+/// Otherwise it returns a failed outcome and does not read `spec.params`.
+pub async fn run_probe(spec: &Spec, policy: &ProbePolicy) -> Result<ProbeOutcome, ProbeError> {
     match spec.kind {
         SpecKind::Cpu => Ok(probe_cpu()),
         SpecKind::Memory => Ok(probe_memory()),
@@ -40,6 +56,7 @@ pub async fn run_probe(spec: &Spec) -> Result<ProbeOutcome, ProbeError> {
         SpecKind::ComplianceWorldWritable => probe_compliance_world_writable(spec),
         SpecKind::ComplianceNtp => probe_compliance_ntp(spec).await,
         SpecKind::ComplianceRebootRequired => probe_compliance_reboot_required(spec),
+        SpecKind::Exec if !policy.allow_exec => Ok(exec_disabled_outcome()),
         SpecKind::Exec => probe_exec(spec).await,
         SpecKind::Skill => {
             let (name, args) = skill_from_params(false, &spec.params)?;
@@ -549,6 +566,16 @@ async fn run_cmd_capture(bin: &str, args: &[&str], timeout_ms: u64) -> Result<Cm
     })
 }
 
+fn exec_disabled_outcome() -> ProbeOutcome {
+    ProbeOutcome {
+        status: "failed",
+        payload: json!({
+            "reason": EXEC_DISABLED_REASON,
+            "error": "exec Spec kind is disabled on this node; enable it node-locally with --allow-exec or NOVBOT_ALLOW_EXEC=true",
+        }),
+    }
+}
+
 async fn probe_exec(spec: &Spec) -> Result<ProbeOutcome, ProbeError> {
     let cmdline = spec
         .params
@@ -611,7 +638,7 @@ mod tests {
             params: json!({}),
             threshold: None,
         };
-        let out = run_probe(&spec).await.unwrap();
+        let out = run_probe(&spec, &ProbePolicy::default()).await.unwrap();
         assert_eq!(out.status, "ok");
         assert!(out.payload.get("total_bytes").is_some());
     }
@@ -624,7 +651,7 @@ mod tests {
             params: json!({"path": "/", "must_exist": true}),
             threshold: None,
         };
-        let out = run_probe(&spec).await.unwrap();
+        let out = run_probe(&spec, &ProbePolicy::default()).await.unwrap();
         assert_eq!(out.status, "ok");
     }
 
@@ -636,7 +663,7 @@ mod tests {
             params: json!({"skill": "host_info"}),
             threshold: None,
         };
-        let out = run_probe(&spec).await.unwrap();
+        let out = run_probe(&spec, &ProbePolicy::default()).await.unwrap();
         assert_eq!(out.status, "ok");
         assert_eq!(out.payload["skill"], "host_info");
     }
@@ -649,7 +676,7 @@ mod tests {
             params: json!({"tool": "echo", "arguments": {"text": "ping"}}),
             threshold: None,
         };
-        let out = run_probe(&spec).await.unwrap();
+        let out = run_probe(&spec, &ProbePolicy::default()).await.unwrap();
         assert_eq!(out.status, "ok");
     }
 
@@ -677,7 +704,7 @@ mod tests {
             params: json!({"max_sample": 8}),
             threshold: None,
         };
-        let out = run_probe(&spec).await.unwrap();
+        let out = run_probe(&spec, &ProbePolicy::default()).await.unwrap();
         assert!(out.payload.get("sample_ports").is_some());
     }
 
@@ -699,8 +726,76 @@ mod tests {
             params: json!({"root": dir.path().to_string_lossy(), "max_findings": 10}),
             threshold: None,
         };
-        let out = run_probe(&spec).await.unwrap();
+        let out = run_probe(&spec, &ProbePolicy::default()).await.unwrap();
         #[cfg(unix)]
         assert_eq!(out.status, "fail");
+    }
+
+    fn touch_marker_spec(
+        dir: &std::path::Path,
+        extra: serde_json::Value,
+    ) -> (Spec, std::path::PathBuf) {
+        let marker = dir.join("marker");
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "command".into(),
+            serde_json::Value::String(format!("touch {}", marker.display())),
+        );
+        if let Some(obj) = extra.as_object() {
+            for (key, value) in obj {
+                params.insert(key.clone(), value.clone());
+            }
+        }
+        let spec = Spec {
+            id: "exec-marker".into(),
+            kind: SpecKind::Exec,
+            params: serde_json::Value::Object(params),
+            threshold: None,
+        };
+        (spec, marker)
+    }
+
+    #[tokio::test]
+    async fn exec_disabled_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, marker) = touch_marker_spec(dir.path(), json!({}));
+        let out = run_probe(&spec, &ProbePolicy::default()).await.unwrap();
+        assert_eq!(out.status, "failed");
+        assert_eq!(out.payload["reason"], "exec_disabled");
+        assert_eq!(
+            out.payload["error"],
+            "exec Spec kind is disabled on this node; enable it node-locally with --allow-exec or NOVBOT_ALLOW_EXEC=true"
+        );
+        assert!(!marker.exists());
+        assert!(!out.payload.to_string().contains("touch"));
+    }
+
+    #[tokio::test]
+    async fn exec_spec_params_cannot_enable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, marker) =
+            touch_marker_spec(dir.path(), json!({"allow_exec": true, "enabled": true}));
+        let out = run_probe(&spec, &ProbePolicy::default()).await.unwrap();
+        assert_eq!(out.status, "failed");
+        assert_eq!(out.payload["reason"], "exec_disabled");
+        assert!(!marker.exists());
+        assert!(!out.payload.to_string().contains("touch"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_enabled_by_policy_runs() {
+        let spec = Spec {
+            id: "exec-echo".into(),
+            kind: SpecKind::Exec,
+            params: json!({"command": "echo hi"}),
+            threshold: None,
+        };
+        let out = run_probe(&spec, &ProbePolicy { allow_exec: true })
+            .await
+            .unwrap();
+        assert_eq!(out.status, "ok");
+        let stdout = out.payload["stdout"].as_str().unwrap();
+        assert!(stdout.contains("hi"), "{stdout}");
     }
 }

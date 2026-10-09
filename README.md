@@ -103,13 +103,15 @@ cargo run -p novbot-node -- \
 
 Center address, node id, and bootstrap token resolve in this order: CLI flag, then environment variable, then a TOML file (`--config` or `NOVBOT_CONFIG`). The center address is required. When the node ID is not set by flag, env, or file, it falls back to `<data-dir>/node_id` (loaded, or generated and persisted).
 
+The `exec` Spec kind is disabled unless this node is started with `--allow-exec` or `NOVBOT_ALLOW_EXEC=true` (accepted true values: `1`, `true`, `yes`, `on`; false: `0`, `false`, `no`, `off`). `--allow-exec` wins over the environment variable. Any other value makes the process exit 2. Neither the center nor the TOML file can turn exec on.
+
 ```toml
 center_grpc = "http://novbot-center:50051"
 node_id = "orb-arm-1"
 bootstrap_token = "replace-me"
 ```
 
-The file may contain only those three keys. Any other key is rejected. The address must be `http(s)://host:port` with an explicit port. Environment variables: `NOVBOT_CENTER_GRPC`, `NOVBOT_NODE_ID`, `NOVBOT_BOOTSTRAP_TOKEN`.
+The file may contain only those three keys. Any other key, including `allow_exec`, is rejected. The address must be `http(s)://host:port` with an explicit port. Environment variables: `NOVBOT_CENTER_GRPC`, `NOVBOT_NODE_ID`, `NOVBOT_BOOTSTRAP_TOKEN`, `NOVBOT_ALLOW_EXEC`.
 
 On success the node writes `./data/demo-1/last_result.json` (single-file OSS egress).
 
@@ -139,7 +141,7 @@ Built-in skills/tools: `host_info`, `echo`, `env_get` — see `GET /v1/skills`.
 | `compliance_world_writable` | Bounded walk for world-writable paths (default `/etc`) |
 | `compliance_ntp` | `timedatectl` / `chronyc` sync check |
 | `compliance_reboot_required` | `/var/run/reboot-required` marker |
-| `exec` | Bounded shell command |
+| `exec` | Bounded shell command. Disabled by default; enable node-locally with `--allow-exec` or `NOVBOT_ALLOW_EXEC=true` |
 | `skill` | In-process skill (`params.skill`) |
 | `mcp_tool` | MCP-style tool (`params.tool` + `params.arguments`) |
 

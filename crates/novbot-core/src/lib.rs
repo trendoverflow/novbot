@@ -9,7 +9,7 @@ pub mod schedule;
 pub mod skill;
 pub mod spec;
 
-pub use probe::{run_probe, ProbeError, ProbeOutcome};
+pub use probe::{run_probe, ProbeError, ProbeOutcome, ProbePolicy, EXEC_DISABLED_REASON};
 pub use retry::{write_egress_result, PendingReport, RetrySpool};
 pub use schedule::{cron_matches, due_specs, parse_schedules_json, Schedule};
 pub use skill::{invoke_skill, list_skills, skill_from_params};

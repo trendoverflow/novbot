@@ -33,7 +33,7 @@ pub enum SpecKind {
     ComplianceNtp,
     /// Reboot-required marker (e.g. /var/run/reboot-required).
     ComplianceRebootRequired,
-    /// Escape hatch: bounded shell command.
+    /// Bounded shell command. Runs only when the node-local probe policy allows exec.
     Exec,
     /// Named in-process skill (DispatchCommand / schedule).
     Skill,
