@@ -154,7 +154,6 @@ fn utc_parts(unix_secs: u64) -> (u32, u32, u32, u32, u32) {
 
 /// Howard Hinnant civil_from_days (days since 1970-01-01 + 719468 offset applied by caller).
 fn civil_from_days(z: i64) -> (i32, u32, u32) {
-    let z = z;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
@@ -178,7 +177,7 @@ fn field_match(field: &str, value: u32, min: u32, max: u32) -> bool {
         }
         if let Some(step_str) = part.strip_prefix("*/") {
             if let Ok(step) = step_str.parse::<u32>() {
-                if step > 0 && value >= min && ((value - min) % step == 0) {
+                if step > 0 && value >= min && (value - min).is_multiple_of(step) {
                     return true;
                 }
             }
@@ -197,7 +196,11 @@ fn field_match(field: &str, value: u32, min: u32, max: u32) -> bool {
                 continue;
             }
             if let (Ok(start), Ok(step)) = (base.parse::<u32>(), step_str.parse::<u32>()) {
-                if step > 0 && value >= start && (value - start) % step == 0 && value <= max {
+                if step > 0
+                    && value >= start
+                    && (value - start).is_multiple_of(step)
+                    && value <= max
+                {
                     return true;
                 }
             }

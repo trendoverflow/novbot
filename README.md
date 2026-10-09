@@ -101,6 +101,16 @@ cargo run -p novbot-node -- \
   --data-dir ./data/demo-1
 ```
 
+Center address, node id, and bootstrap token resolve in this order: CLI flag, then environment variable, then a TOML file (`--config` or `NOVBOT_CONFIG`). The center address is required. When the node ID is not set by flag, env, or file, it falls back to `<data-dir>/node_id` (loaded, or generated and persisted).
+
+```toml
+center_grpc = "http://novbot-center:50051"
+node_id = "orb-arm-1"
+bootstrap_token = "replace-me"
+```
+
+The file may contain only those three keys. Any other key is rejected. The address must be `http(s)://host:port` with an explicit port. Environment variables: `NOVBOT_CENTER_GRPC`, `NOVBOT_NODE_ID`, `NOVBOT_BOOTSTRAP_TOKEN`.
+
 On success the node writes `./data/demo-1/last_result.json` (single-file OSS egress).
 
 ### 6. Dispatch a skill / MCP tool (M5)
