@@ -1,0 +1,23 @@
+[package]
+name = "os-release-check"
+version = "1.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Read /etc/os-release, including PRETTY_NAME, and the hostname"
+
+# Separate workspace so this component is not a member of the host workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+novbot-skill-sdk = { path = "../../crates/novbot-skill-sdk" }
+serde_json = "1"
+
+[profile.release]
+opt-level = 1
+lto = false
+codegen-units = 16
+panic = "abort"

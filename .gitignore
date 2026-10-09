@@ -1,5 +1,8 @@
 /target/
 crates/novbot-skill-runtime/guest/target/
+examples/**/target/
+examples/**/*.nbskill
+examples/**/*.sha256
 **/*.rs.bk
 .DS_Store
 .env

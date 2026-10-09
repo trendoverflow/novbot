@@ -69,6 +69,18 @@ pub fn open_package(
     expect_name: &str,
     expect_version: &str,
 ) -> Result<Package, InstallError> {
+    load_package_inner(bytes, Some((expect_name, expect_version)))
+}
+
+/// Open an archive and validate it against the manifest stored inside.
+pub fn load_package(bytes: &[u8]) -> Result<Package, InstallError> {
+    load_package_inner(bytes, None)
+}
+
+fn load_package_inner(
+    bytes: &[u8],
+    expected: Option<(&str, &str)>,
+) -> Result<Package, InstallError> {
     if bytes.len() as u64 > PACKAGE_MAX {
         return Err(fail("invalid_archive", "package exceeds 16 MiB"));
     }
@@ -79,14 +91,16 @@ pub fn open_package(
     let toml_text = std::str::from_utf8(toml_bytes)
         .map_err(|_| fail("invalid_manifest", "skill.toml is not utf-8"))?;
     let manifest = parse_manifest(toml_text)?;
-    if manifest.name != expect_name || manifest.version != expect_version {
-        return Err(fail(
-            "invalid_manifest",
-            format!(
-                "manifest {}@{} does not match desired {}@{}",
-                manifest.name, manifest.version, expect_name, expect_version
-            ),
-        ));
+    if let Some((expect_name, expect_version)) = expected {
+        if manifest.name != expect_name || manifest.version != expect_version {
+            return Err(fail(
+                "invalid_manifest",
+                format!(
+                    "manifest {}@{} does not match desired {}@{}",
+                    manifest.name, manifest.version, expect_name, expect_version
+                ),
+            ));
+        }
     }
     if manifest.abi != ABI {
         return Err(fail(

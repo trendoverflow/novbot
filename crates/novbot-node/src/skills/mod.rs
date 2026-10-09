@@ -22,7 +22,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
-pub use package::{current_platform, pack_skill, sha256_hex, PackSpec, ABI, CATALOG};
+pub use package::{
+    current_platform, load_package, open_package, pack_skill, sha256_hex, Manifest, PackSpec,
+    Package, ABI, CATALOG,
+};
 pub use source::{ArtifactSource, Fetched, GrpcArtifactSource};
 
 const DEFAULT_CONCURRENCY: u32 = 4;

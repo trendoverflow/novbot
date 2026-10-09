@@ -1,0 +1,19 @@
+schema_version = 1
+name = "listening-ports"
+version = "1.0.0"
+display_name = "Listening ports"
+description = "Return listening sockets from the host"
+
+[runtime]
+kind = "wasm"
+abi = "novbot:skill@1"
+
+[runtime.limits]
+timeout_ms = 10000
+memory_mb = 32
+
+[files]
+
+[[capabilities]]
+name = "net.listening_ports.read"
+reason = "List listening sockets"
