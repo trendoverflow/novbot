@@ -31,3 +31,4 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio-stream = { workspace = true, features = ["net"] }
+tower = { workspace = true, features = ["util"] }
