@@ -15,6 +15,11 @@ mod skill_desired;
 mod d10_7;
 #[cfg(test)]
 mod d10_execute;
+#[cfg(test)]
+mod d10_lifecycle;
+#[cfg(test)]
+#[path = "../../novbot-node/src/hub_pack.rs"]
+mod hub_pack;
 
 use anyhow::Context;
 use clap::Parser;
