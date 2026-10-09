@@ -297,6 +297,10 @@ struct CapabilityToml {
     grant: Option<String>,
 }
 
+pub fn manifest_from_str(text: &str) -> Result<Manifest, InstallError> {
+    parse_manifest(text)
+}
+
 fn parse_manifest(text: &str) -> Result<Manifest, InstallError> {
     let raw: ManifestToml = toml::from_str(text)
         .map_err(|err| fail("invalid_manifest", format!("skill.toml: {err}")))?;

@@ -13,7 +13,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
@@ -36,6 +36,8 @@ const SKILL_ABI: &str = "novbot:skill@1";
 pub struct SkillRuntime {
     engine: Engine,
     cache: Mutex<Option<(u64, Component)>>,
+    /// Entries into [`run`], including runs that fail before the guest is called.
+    entries: AtomicU64,
 }
 
 pub struct RunRequest<'a> {
@@ -69,7 +71,13 @@ impl SkillRuntime {
         Ok(Self {
             engine,
             cache: Mutex::new(None),
+            entries: AtomicU64::new(0),
         })
+    }
+
+    /// How many times [`run`] has been entered on this runtime.
+    pub fn run_entries(&self) -> u64 {
+        self.entries.load(Ordering::SeqCst)
     }
 
     /// Filesystem-safe id: wasmtime version, target, and the engine's precompile hash.
@@ -125,6 +133,7 @@ impl SkillRuntime {
 }
 
 pub fn run(runtime: &SkillRuntime, request: RunRequest<'_>) -> RunOutput {
+    runtime.entries.fetch_add(1, Ordering::SeqCst);
     let grants = match GrantSet::parse(request.grants) {
         Ok(grants) => grants,
         Err(err) => {
@@ -583,14 +592,59 @@ impl crate::novbot::skill::log::Host for RunCtx {
 }
 
 fn read_limited(path: &Path, max_bytes: u32) -> std::io::Result<Vec<u8>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let file = match open_nofollow(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound && is_os_release_path(path) => {
+            // Hosts without `/etc/os-release` (this Mac) can point the missing
+            // path at a temp fixture. A file that is actually present is opened
+            // above and is never replaced.
+            match missing_os_release_fixture() {
+                Some(fixture) => open_nofollow(&fixture)?,
+                None => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+    };
     let limit = u64::from(max_bytes.min(MAX_READ_BYTES));
     let mut buf = Vec::new();
     file.take(limit).read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn is_os_release_path(path: &Path) -> bool {
+    matches!(
+        path.to_str(),
+        Some("/etc/os-release") | Some("/private/etc/os-release")
+    )
+}
+
+/// `fs.read` of `/etc/os-release` uses `path` only when that file is absent.
+///
+/// `None` clears the fixture. This does not create `/etc/os-release`.
+pub fn set_missing_os_release_fixture(path: Option<PathBuf>) {
+    let mut slot = os_release_fixture()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *slot = path;
+}
+
+fn missing_os_release_fixture() -> Option<PathBuf> {
+    os_release_fixture()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+fn os_release_fixture() -> &'static Mutex<Option<PathBuf>> {
+    static FIXTURE: Mutex<Option<PathBuf>> = Mutex::new(None);
+    &FIXTURE
 }
 
 fn stat_path(path: &Path) -> std::io::Result<crate::novbot::skill::fs::FileStat> {

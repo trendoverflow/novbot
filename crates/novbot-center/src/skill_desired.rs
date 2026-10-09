@@ -1337,6 +1337,103 @@ pub(crate) async fn append_node_audit(
     .await
 }
 
+/// Store a node result. A payload with a non-empty `denials` array writes one
+/// `skill.capability_denied` audit event for that `run_id`.
+///
+/// A second store of the same `run_id` inserts another result row and does not
+/// append another denial event. The event is derived from the stored payload.
+pub(crate) async fn store_reported_result(
+    db: &Db,
+    node_id: &str,
+    run_id: &str,
+    spec_id: &str,
+    status: &str,
+    payload_json: &str,
+    observed_at: DateTime<Utc>,
+) -> Result<(), DesiredError> {
+    db.insert_result(node_id, run_id, spec_id, status, payload_json, observed_at)
+        .await
+        .map_err(DesiredError::Internal)?;
+    let Some((target_id, detail_json)) = denial_audit_detail(run_id, spec_id, payload_json) else {
+        return Ok(());
+    };
+    let mut tx = db.pool().begin().await.map_err(db_err)?;
+    lock_audit_chain(&mut tx).await?;
+    if !denial_already_stored(&mut tx, node_id, run_id).await? {
+        append_node_audit(
+            &mut tx,
+            node_id,
+            "skill.capability_denied",
+            &target_id,
+            &detail_json,
+        )
+        .await?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(())
+}
+
+fn denial_audit_detail(
+    run_id: &str,
+    spec_id: &str,
+    payload_json: &str,
+) -> Option<(String, String)> {
+    let payload: Value = serde_json::from_str(payload_json).ok()?;
+    let denials = payload.get("denials")?.as_array()?;
+    if denials.is_empty() {
+        return None;
+    }
+    let mut detail = serde_json::json!({
+        "run_id": run_id,
+        "spec_id": spec_id,
+        "denials": denials,
+    });
+    if let Some(skill) = payload.get("skill").and_then(Value::as_object) {
+        let mut recorded = serde_json::Map::new();
+        for key in ["name", "version", "sha256"] {
+            if let Some(value) = skill.get(key) {
+                if !value.is_null() {
+                    recorded.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        if !recorded.is_empty() {
+            detail["skill"] = Value::Object(recorded);
+        }
+    }
+    let target_id = detail
+        .get("skill")
+        .and_then(|skill| skill.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(spec_id)
+        .to_string();
+    let detail_json = serde_json::to_string(&detail).ok()?;
+    Some((target_id, detail_json))
+}
+
+async fn denial_already_stored(
+    tx: &mut Transaction<'_, MySql>,
+    node_id: &str,
+    run_id: &str,
+) -> Result<bool, DesiredError> {
+    let row = sqlx::query(
+        r#"
+        SELECT id FROM audit_events
+        WHERE action = 'skill.capability_denied'
+          AND node_id = ?
+          AND JSON_UNQUOTE(JSON_EXTRACT(detail_json, '$.run_id')) = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(node_id)
+    .bind(run_id)
+    .fetch_optional(tx.deref_mut())
+    .await
+    .map_err(db_err)?;
+    Ok(row.is_some())
+}
+
 async fn append_audit_as(
     tx: &mut Transaction<'_, MySql>,
     actor_type: &str,

@@ -8,8 +8,10 @@ mod package;
 mod source;
 
 use novbot_proto::{DesiredSkills, InstalledSkill, SkillStateReport};
-use novbot_skill_runtime::SkillRuntime;
+use novbot_skill_runtime::{RunRequest, SkillRuntime};
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -445,6 +447,107 @@ impl SkillHost {
             .unwrap_or_else(|err| err.into_inner())
             .clone();
         sem.try_acquire_owned().ok()
+    }
+
+    /// How many times this host has entered `novbot_skill_runtime::run`.
+    pub fn wasm_run_entries(&self) -> u64 {
+        self.runtime.run_entries()
+    }
+
+    /// Run one installed Hub skill.
+    ///
+    /// Built-ins are not handled here. The permit is held inside the blocking
+    /// call until `run` returns, including timeout, denial, and trap.
+    pub async fn run_hub(&self, run: HubRun) -> (String, Value) {
+        let Some(installed) = self.read().skills.get(&run.name).cloned() else {
+            return hub_error("skill_not_installed", "skill is not installed", None, None);
+        };
+        let identity = json!({
+            "name": run.name,
+            "version": installed.version,
+            "sha256": installed.sha256,
+        });
+        if let Some(version) = &run.version {
+            if !version_guard_ok(&installed.version, version) {
+                return hub_error(
+                    "version_mismatch",
+                    "installed version does not satisfy params.version",
+                    Some(identity),
+                    None,
+                );
+            }
+        }
+        let loaded = match load_installed(&self.store_path(&installed.sha256)) {
+            Ok(loaded) => loaded,
+            Err(message) => {
+                return hub_error("skill_error", message, Some(identity), None);
+            }
+        };
+        if let Some(schema) = &loaded.schema {
+            match argument_pointers(schema, &run.arguments) {
+                Ok(pointers) if pointers.is_empty() => {}
+                Ok(pointers) => {
+                    return hub_error(
+                        "invalid_params",
+                        "arguments do not match schema/params.json",
+                        Some(identity),
+                        Some(json!({ "pointers": pointers })),
+                    );
+                }
+                Err(()) => {
+                    return hub_error(
+                        "invalid_params",
+                        "schema/params.json could not be applied",
+                        Some(identity),
+                        Some(json!({ "pointers": [] })),
+                    );
+                }
+            }
+        }
+        let Some(memory_bytes) = usize::try_from(installed.memory_bytes).ok() else {
+            return hub_error(
+                "resource_limit",
+                "installed memory cap does not fit this process",
+                Some(identity),
+                None,
+            );
+        };
+        let Some(permit) = self.try_acquire_run() else {
+            return hub_error(
+                "resource_limit",
+                "max_concurrent_runs is busy",
+                Some(identity),
+                None,
+            );
+        };
+        let runtime = Arc::clone(&self.runtime);
+        let timeout = Duration::from_millis(installed.timeout_ms);
+        let data_dir = run.data_dir.clone();
+        let params_json = run.arguments.to_string();
+        let grants = loaded.grants;
+        let module = loaded.module;
+        let joined = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let grant_refs: Vec<&str> = grants.iter().map(String::as_str).collect();
+            let output = novbot_skill_runtime::run(
+                &runtime,
+                RunRequest {
+                    component_bytes: &module,
+                    grants: &grant_refs,
+                    params_json: &params_json,
+                    data_dir: Some(data_dir.as_path()),
+                    timeout: Some(timeout),
+                    memory_bytes: Some(memory_bytes),
+                },
+            );
+            drop(_permit);
+            output
+        })
+        .await;
+        match joined {
+            Ok(output) => map_run_output(identity, output),
+            Err(_) => hub_error("skill_trap", "skill run task stopped", Some(identity), None),
+        }
     }
 
     pub fn snapshot(&self) -> SkillSnapshot {
@@ -900,6 +1003,209 @@ impl SkillHost {
 
     fn clone_active(&self) -> BTreeMap<String, ActiveSkill> {
         self.read().skills.clone()
+    }
+}
+
+/// One Hub skill execution. `version` is the raw `params.version` value when present.
+pub struct HubRun {
+    pub name: String,
+    pub version: Option<Value>,
+    pub arguments: Value,
+    pub data_dir: PathBuf,
+}
+
+struct LoadedSkill {
+    module: Vec<u8>,
+    grants: Vec<String>,
+    schema: Option<Vec<u8>>,
+}
+
+fn load_installed(dir: &Path) -> Result<LoadedSkill, &'static str> {
+    let module =
+        fs::read(dir.join("module.wasm")).map_err(|_| "installed module.wasm is missing")?;
+    let text = fs::read_to_string(dir.join("skill.toml"))
+        .map_err(|_| "installed skill.toml is missing")?;
+    let manifest =
+        package::manifest_from_str(&text).map_err(|_| "installed skill.toml is invalid")?;
+    let schema_path = dir.join("schema/params.json");
+    let schema = if schema_path.is_file() {
+        Some(fs::read(&schema_path).map_err(|_| "installed schema/params.json is unreadable")?)
+    } else {
+        None
+    };
+    Ok(LoadedSkill {
+        module,
+        grants: manifest.grants,
+        schema,
+    })
+}
+
+fn version_guard_ok(installed: &str, requirement: &Value) -> bool {
+    let Some(requirement) = requirement.as_str() else {
+        return false;
+    };
+    let requirement = requirement.trim();
+    if requirement.is_empty() || requirement == "*" {
+        return true;
+    }
+    let Ok(installed) = Version::parse(installed) else {
+        return false;
+    };
+    if let Ok(exact) = Version::parse(requirement) {
+        return installed == exact;
+    }
+    VersionReq::parse(requirement).is_ok_and(|parsed| parsed.matches(&installed))
+}
+
+/// JSON pointers only. `Err` means the schema document itself cannot be applied.
+fn argument_pointers(schema_bytes: &[u8], arguments: &Value) -> Result<Vec<String>, ()> {
+    let mut schema: Value = serde_json::from_slice(schema_bytes).map_err(|_| ())?;
+    // `$schema` is an annotation. Drop it so validation does not fetch a meta-schema.
+    if let Some(obj) = schema.as_object_mut() {
+        obj.remove("$schema");
+    }
+    let validator = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .build(&schema)
+        .map_err(|_| ())?;
+    if validator.is_valid(arguments) {
+        return Ok(Vec::new());
+    }
+    let mut pointers = Vec::new();
+    for error in validator.iter_errors(arguments) {
+        let pointer = error.instance_path.to_string();
+        let pointer = if pointer.is_empty() {
+            "/".to_string()
+        } else {
+            pointer
+        };
+        if !pointers.contains(&pointer) {
+            pointers.push(pointer);
+        }
+    }
+    if pointers.is_empty() {
+        pointers.push("/".to_string());
+    }
+    pointers.sort();
+    Ok(pointers)
+}
+
+fn hub_error(
+    code: &str,
+    message: &str,
+    skill: Option<Value>,
+    extra_error: Option<Value>,
+) -> (String, Value) {
+    let mut error = json!({
+        "code": code,
+        "message": message,
+    });
+    if let Some(Value::Object(fields)) = extra_error {
+        if let Some(obj) = error.as_object_mut() {
+            for (key, value) in fields {
+                obj.insert(key, value);
+            }
+        }
+    }
+    let mut payload = json!({ "error": error });
+    if let Some(skill) = skill {
+        payload["skill"] = skill;
+    }
+    ("error".to_string(), payload)
+}
+
+fn map_run_output(identity: Value, output: novbot_skill_runtime::RunOutput) -> (String, Value) {
+    let mut payload = json!({ "skill": identity });
+    if !output.denials.is_empty() {
+        let message = output
+            .error
+            .as_ref()
+            .map(|err| clip_message(&err.message))
+            .unwrap_or_else(|| "host call was outside the skill's declared capabilities".into());
+        payload["error"] = json!({
+            "code": "capability_denied",
+            "message": message,
+        });
+        payload["denials"] = serde_json::to_value(&output.denials).unwrap_or_else(|_| json!([]));
+        if let Some(partial) = output.partial {
+            payload["partial"] = json_or_string(&partial);
+        }
+        return ("error".into(), payload);
+    }
+    if output.status == "ok" {
+        if let Some(text) = output.output {
+            merge_guest_output(&mut payload, &text);
+        }
+        let status = if findings_have_fail(&payload) {
+            "fail"
+        } else {
+            "ok"
+        };
+        return (status.to_string(), payload);
+    }
+    let (code, message) = match output.error {
+        Some(err) => (
+            map_run_code(&err.code).to_string(),
+            clip_message(&err.message),
+        ),
+        None => ("skill_trap".to_string(), "skill run failed".to_string()),
+    };
+    payload["error"] = json!({
+        "code": code,
+        "message": message,
+    });
+    ("error".into(), payload)
+}
+
+fn map_run_code(code: &str) -> &str {
+    match code {
+        "guest_error" => "skill_error",
+        "guest_trap" => "skill_trap",
+        other => other,
+    }
+}
+
+fn merge_guest_output(payload: &mut Value, text: &str) {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        payload["output"] = json!(text);
+        return;
+    };
+    let Some(obj) = value.as_object() else {
+        payload["output"] = value;
+        return;
+    };
+    let Some(dest) = payload.as_object_mut() else {
+        return;
+    };
+    for (key, value) in obj {
+        if matches!(key.as_str(), "skill" | "error" | "denials" | "partial") {
+            continue;
+        }
+        dest.insert(key.clone(), value.clone());
+    }
+}
+
+fn findings_have_fail(payload: &Value) -> bool {
+    payload
+        .get("findings")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("status").and_then(Value::as_str) == Some("fail"))
+        })
+}
+
+fn json_or_string(text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
+}
+
+fn clip_message(message: &str) -> String {
+    const MAX: usize = 512;
+    if message.len() <= MAX {
+        message.to_string()
+    } else {
+        message[..MAX].to_string()
     }
 }
 

@@ -13,6 +13,8 @@ mod skill_desired;
 
 #[cfg(test)]
 mod d10_7;
+#[cfg(test)]
+mod d10_execute;
 
 use anyhow::Context;
 use clap::Parser;
