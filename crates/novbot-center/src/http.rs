@@ -12,7 +12,6 @@ use axum::{Json, Router};
 use novbot_proto::{server_message, Dispatch, ServerMessage};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -286,10 +285,9 @@ async fn put_config(
     Path(id): Path<String>,
     Json(body): Json<PutConfigBody>,
 ) -> Result<Json<NodeConfig>, ApiError> {
-    let _ = st
-        .db
-        .upsert_node(&id, "", "http-admin", &HashMap::new())
-        .await;
+    // The nodes row must exist for the node_configs FK. Do not upsert:
+    // that overwrites hostname, version, labels, and last_seen_at.
+    st.db.ensure_node_placeholder(&id).await?;
     let specs_json = serde_json::to_string(&body.specs)?;
     let schedules_json = body
         .schedules
@@ -354,8 +352,7 @@ async fn dispatch_to_node(
     run_id: Option<String>,
 ) -> Result<(String, &'static str), ApiError> {
     let run_id = run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    let params_json =
-        serde_json::to_string(&params.unwrap_or(Value::Object(Default::default())))?;
+    let params_json = serde_json::to_string(&params.unwrap_or(Value::Object(Default::default())))?;
 
     let msg = ServerMessage {
         request_id: Uuid::new_v4().to_string(),
@@ -565,5 +562,155 @@ impl IntoResponse for ApiError {
             })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{router, AppState};
+    use crate::db::{connect_test_db, Db, NodeConfig, NodeRow};
+    use crate::hub::Hub;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+
+    async fn fetch_node(db: &Db, id: &str) -> NodeRow {
+        db.list_nodes()
+            .await
+            .expect("list nodes")
+            .into_iter()
+            .find(|n| n.node_id == id)
+            .unwrap_or_else(|| panic!("missing node {id}"))
+    }
+
+    fn parse_json(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).unwrap_or_else(|e| panic!("json ({e}): {raw}"))
+    }
+
+    /// PUT /v1/nodes/:id/config through `router()`, the handler's real path.
+    async fn http_put_config(db: Db, id: &str, specs: &serde_json::Value) -> NodeConfig {
+        let app = router(AppState {
+            db,
+            hub: Hub::new(),
+            api_token: None,
+            license_env: None,
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/nodes/{id}/config"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "specs": specs }).to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router oneshot");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "PUT /v1/nodes/{id}/config: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "decode NodeConfig ({e}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn put_config_keeps_registration_metadata() {
+        let Some(db) = connect_test_db().await else {
+            return;
+        };
+        let id = format!("t16-{}", uuid::Uuid::new_v4());
+        let mut labels = HashMap::new();
+        labels.insert("env".to_string(), "demo".to_string());
+        labels.insert("role".to_string(), "app".to_string());
+        db.upsert_node(&id, "host-a", "0.1.0", &labels)
+            .await
+            .expect("upsert");
+
+        let before = fetch_node(&db, &id).await;
+        let before_gen = db
+            .get_config(&id)
+            .await
+            .expect("get config")
+            .expect("config row")
+            .config_generation;
+
+        // A registration rewrite would bump last_seen_at as well as the labels.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let specs = serde_json::json!([
+            {
+                "id": "echo-1",
+                "kind": "skill",
+                "params": {"skill": "echo", "message": "hi"}
+            }
+        ]);
+        let cfg = http_put_config(db.clone(), &id, &specs).await;
+
+        let after = fetch_node(&db, &id).await;
+        assert_eq!(after.hostname, "host-a");
+        assert_eq!(after.version, "0.1.0");
+        assert_eq!(
+            after.labels,
+            serde_json::json!({"env": "demo", "role": "app"})
+        );
+        assert_eq!(after.last_seen_at, before.last_seen_at);
+
+        assert_eq!(cfg.config_generation, before_gen + 1);
+        assert_eq!(cfg.node_id, id);
+        assert_eq!(parse_json(&cfg.specs_json), specs);
+
+        let stored = db.get_config(&id).await.expect("get config").expect("row");
+        assert_eq!(stored.config_generation, before_gen + 1);
+        assert_eq!(parse_json(&stored.specs_json), specs);
+    }
+
+    #[tokio::test]
+    async fn put_config_unknown_node_creates_placeholder_then_register_fills() {
+        let Some(db) = connect_test_db().await else {
+            return;
+        };
+        let id = format!("t16-{}", uuid::Uuid::new_v4());
+        let specs = serde_json::json!([
+            {"id": "disk", "kind": "probe", "params": {"mount": "/"}}
+        ]);
+        let cfg = http_put_config(db.clone(), &id, &specs).await;
+        assert_eq!(cfg.config_generation, 1);
+        assert_eq!(cfg.node_id, id);
+        assert_eq!(parse_json(&cfg.specs_json), specs);
+
+        let placeholder = fetch_node(&db, &id).await;
+        assert_eq!(placeholder.hostname, "");
+        assert_eq!(placeholder.version, "");
+        assert_eq!(placeholder.labels, serde_json::json!({}));
+        assert_eq!(placeholder.last_seen_at, None);
+
+        let mut labels = HashMap::new();
+        labels.insert("role".to_string(), "db".to_string());
+        db.upsert_node(&id, "host-b", "0.1.0", &labels)
+            .await
+            .expect("register");
+
+        let registered = fetch_node(&db, &id).await;
+        assert_eq!(registered.hostname, "host-b");
+        assert_eq!(registered.version, "0.1.0");
+        assert_eq!(registered.labels, serde_json::json!({"role": "db"}));
+
+        let stored = db.get_config(&id).await.expect("get config").expect("row");
+        assert_eq!(stored.config_generation, 1);
+        assert_eq!(parse_json(&stored.specs_json), specs);
     }
 }
