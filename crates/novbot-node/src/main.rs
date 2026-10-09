@@ -50,6 +50,10 @@ struct Args {
     #[arg(long, env = "NOVBOT_BOOTSTRAP_TOKEN")]
     bootstrap_token: Option<String>,
 
+    /// Node labels sent on Register, as comma-separated key=value pairs (e.g. "role=db,env=demo").
+    #[arg(long, env = "NOVBOT_NODE_LABELS", default_value = "")]
+    labels: String,
+
     #[arg(long, default_value = "15")]
     heartbeat_secs: u64,
 
@@ -205,7 +209,7 @@ async fn run_session(
             hostname: hostname.to_string(),
             version: VERSION.into(),
             bootstrap_token: args.bootstrap_token.clone().unwrap_or_default(),
-            labels: HashMap::new(),
+            labels: parse_labels(&args.labels),
         })),
     })
     .await
@@ -243,6 +247,20 @@ async fn run_session(
     }
 
     Ok(())
+}
+
+/// Parse "k=v,k2=v2" into a label map. Blank entries and entries without '=' or with an empty key are ignored.
+fn parse_labels(raw: &str) -> HashMap<String, String> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() {
+                return None;
+            }
+            Some((k.to_string(), v.trim().to_string()))
+        })
+        .collect()
 }
 
 async fn try_send(out: &SessionOut, msg: ClientMessage) -> bool {
@@ -556,4 +574,22 @@ async fn flush_spool(spool: &RetrySpool, out: &SessionOut) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::parse_labels;
+
+    #[test]
+    fn parses_pairs_and_ignores_junk() {
+        let m = parse_labels(" role=db , env=demo,,novalue, =x");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get("role").map(String::as_str), Some("db"));
+        assert_eq!(m.get("env").map(String::as_str), Some("demo"));
+    }
+
+    #[test]
+    fn empty_is_empty() {
+        assert!(parse_labels("").is_empty());
+    }
 }
