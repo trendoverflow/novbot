@@ -3,19 +3,26 @@
 
 use crate::db::{Db, NodeConfig, NodeRow, ResultRow};
 use crate::hub::Hub;
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use crate::skill_catalog::{self, HubSkillItem, SkillDetail, VersionDetail};
+use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use novbot_proto::{server_message, Dispatch, ServerMessage};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
+
+/// Axum's default body limit is 2 MiB. The upload route accepts 16 MiB + 1 MiB so a
+/// body of 16 MiB + 1 byte reaches the handler and returns `package_too_large`.
+const UPLOAD_BODY_LIMIT: usize = crate::db::PACKAGE_MAX_BYTES as usize + 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,7 +45,18 @@ pub fn router(state: AppState) -> Router {
         .route("/nodes/{id}/dispatch", post(dispatch_command))
         .route("/results", get(list_results))
         .route("/license", get(get_license).put(put_license))
-        .route("/skills", get(list_skills))
+        .route(
+            "/skills",
+            get(list_skills)
+                .post(upload_skill)
+                .layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
+        .route("/skills/{name}", get(get_skill))
+        .route("/skills/{name}/versions/{version}", get(get_skill_version))
+        .route(
+            "/skills/{name}/versions/{version}/package",
+            get(get_skill_package),
+        )
         .route("/fleet/skill-groups", get(list_skill_groups))
         .route("/fleet/skill-groups/push", post(push_skill_group))
         .route("/tokens", get(tokens_status).post(create_token))
@@ -59,12 +77,103 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"ok": true, "service": "novbot-center"}))
 }
 
-async fn list_skills() -> impl IntoResponse {
-    Json(serde_json::json!({
-        "skills": novbot_core::list_skills(),
-        "note": "Invoke via Spec kind skill / mcp_tool, or POST /v1/nodes/:id/dispatch",
+#[derive(Serialize)]
+struct ListSkillsBody {
+    skills: Vec<&'static str>,
+    items: Vec<HubSkillItem>,
+    next_page_token: Option<&'static str>,
+    note: &'static str,
+}
+
+struct SkillUploadBody(Bytes);
+
+impl<S> FromRequest<S> for SkillUploadBody
+where
+    S: Send + Sync,
+{
+    type Rejection = BytesRejection;
+
+    async fn from_request(mut req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        DefaultBodyLimit::max(UPLOAD_BODY_LIMIT).apply(&mut req);
+        Ok(Self(Bytes::from_request(req, state).await?))
+    }
+}
+
+async fn list_skills(State(st): State<AppState>) -> Result<Json<ListSkillsBody>, ApiError> {
+    let items = skill_catalog::list_hub_items(&st.db).await?;
+    Ok(Json(ListSkillsBody {
+        skills: novbot_core::list_skills(),
+        items,
+        next_page_token: None,
+        note: "Invoke via Spec kind skill / mcp_tool, or POST /v1/nodes/:id/dispatch",
     }))
 }
+
+async fn upload_skill(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    SkillUploadBody(body): SkillUploadBody,
+) -> Result<Response, ApiError> {
+    let content_type = match headers.get(header::CONTENT_TYPE) {
+        None => None,
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return Err(ApiError::coded(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_archive",
+                    "Content-Type must be application/vnd.novbot.skill",
+                ));
+            }
+        },
+    };
+    let sha_header = match headers.get("x-novbot-sha256") {
+        None => None,
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return Err(ApiError::coded(
+                    StatusCode::BAD_REQUEST,
+                    "hash_mismatch",
+                    "X-Novbot-Sha256 does not match the package body",
+                ));
+            }
+        },
+    };
+    let outcome = skill_catalog::register_package(&st.db, content_type, sha_header, &body).await?;
+    let status = if outcome.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(outcome.body)).into_response())
+}
+
+async fn get_skill(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<SkillDetail>, ApiError> {
+    Ok(Json(skill_catalog::get_skill(&st.db, &name).await?))
+}
+
+async fn get_skill_version(
+    State(st): State<AppState>,
+    Path((name, version)): Path<(String, String)>,
+) -> Result<Json<VersionDetail>, ApiError> {
+    Ok(Json(
+        skill_catalog::get_version(&st.db, &name, &version).await?,
+    ))
+}
+
+async fn get_skill_package(
+    State(st): State<AppState>,
+    Path((name, version)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let bytes = skill_catalog::read_package(&st.db, &name, &version).await?;
+    Ok(([(header::CONTENT_TYPE, CONTENT_TYPE_SKILL)], bytes).into_response())
+}
+
+const CONTENT_TYPE_SKILL: &str = "application/vnd.novbot.skill";
 
 async fn require_api_token(
     State(st): State<AppState>,
@@ -502,13 +611,23 @@ pub async fn serve(
 struct ApiError {
     status: StatusCode,
     message: String,
+    code: Option<String>,
 }
 
 impl ApiError {
+    fn coded(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            code: Some(code.to_string()),
+        }
+    }
+
     fn not_found(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message: msg.into(),
+            code: None,
         }
     }
 
@@ -516,6 +635,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: msg.into(),
+            code: None,
         }
     }
 
@@ -523,6 +643,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: msg.into(),
+            code: None,
         }
     }
 
@@ -530,6 +651,7 @@ impl ApiError {
         Self {
             status: StatusCode::PAYMENT_REQUIRED,
             message: msg.into(),
+            code: None,
         }
     }
 }
@@ -539,6 +661,7 @@ impl From<anyhow::Error> for ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: e.to_string(),
+            code: None,
         }
     }
 }
@@ -548,6 +671,61 @@ impl From<serde_json::Error> for ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: e.to_string(),
+            code: None,
+        }
+    }
+}
+
+impl From<skill_catalog::CatalogError> for ApiError {
+    fn from(err: skill_catalog::CatalogError) -> Self {
+        use skill_catalog::CatalogError::*;
+        match err {
+            UploadsDisabled { max_allowed_packet } => ApiError::coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "uploads_disabled",
+                format!(
+                    "uploads disabled: MySQL max_allowed_packet is {max_allowed_packet} bytes, which does not exceed 16 MiB"
+                ),
+            ),
+            PackageTooLarge => ApiError::coded(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "package_too_large",
+                "package exceeds 16 MiB",
+            ),
+            InvalidArchive(message) => {
+                ApiError::coded(StatusCode::BAD_REQUEST, "invalid_archive", message)
+            }
+            InvalidWasm(message) => ApiError::coded(StatusCode::BAD_REQUEST, "invalid_wasm", message),
+            HashMismatch => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "hash_mismatch",
+                "X-Novbot-Sha256 does not match the package body",
+            ),
+            NameReserved => ApiError::coded(
+                StatusCode::CONFLICT,
+                "name_reserved",
+                "skill name is reserved",
+            ),
+            VersionExists => ApiError::coded(
+                StatusCode::CONFLICT,
+                "version_exists",
+                "skill version already exists with a different package",
+            ),
+            CapabilityUnsupported(message) => {
+                ApiError::coded(StatusCode::BAD_REQUEST, "capability_unsupported", message)
+            }
+            CapabilityInvalid(message) => {
+                ApiError::coded(StatusCode::BAD_REQUEST, "capability_invalid", message)
+            }
+            SkillUnknown => {
+                ApiError::coded(StatusCode::NOT_FOUND, "skill_unknown", "unknown skill")
+            }
+            VersionUnknown => ApiError::coded(
+                StatusCode::NOT_FOUND,
+                "version_unknown",
+                "unknown skill version",
+            ),
+            Internal(err) => ApiError::from(err),
         }
     }
 }
@@ -559,6 +737,7 @@ impl IntoResponse for ApiError {
             Json(serde_json::json!({
                 "error": self.message,
                 "license_required": self.status == StatusCode::PAYMENT_REQUIRED,
+                "code": self.code,
             })),
         )
             .into_response()

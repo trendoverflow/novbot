@@ -7,10 +7,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{mysql::MySqlPoolOptions, MySql, Pool, Row};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// Largest accepted `.nbskill` body. `max_allowed_packet` must be strictly larger:
+/// the INSERT packet is the blob plus the SQL text.
+pub const PACKAGE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Uploads are allowed only when MySQL `max_allowed_packet` exceeds 16 MiB.
+pub fn uploads_allowed(max_allowed_packet: u64) -> bool {
+    max_allowed_packet > PACKAGE_MAX_BYTES
+}
 
 #[derive(Clone)]
 pub struct Db {
     pool: Pool<MySql>,
+    uploads_enabled: Arc<AtomicBool>,
+    max_allowed_packet: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,7 +62,43 @@ impl Db {
             .connect(database_url)
             .await
             .context("connect mysql")?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            uploads_enabled: Arc::new(AtomicBool::new(false)),
+            max_allowed_packet: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    pub(crate) fn pool(&self) -> &Pool<MySql> {
+        &self.pool
+    }
+
+    pub fn uploads_enabled(&self) -> bool {
+        self.uploads_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn max_allowed_packet(&self) -> u64 {
+        self.max_allowed_packet.load(Ordering::Relaxed)
+    }
+
+    /// Read `@@GLOBAL.max_allowed_packet` and cache whether uploads may run.
+    ///
+    /// A packet that does not exceed 16 MiB disables uploads. It does not stop the process.
+    pub async fn check_max_allowed_packet(&self) -> Result<()> {
+        let value = read_max_allowed_packet(&self.pool).await?;
+        let allowed = uploads_allowed(value);
+        self.max_allowed_packet.store(value, Ordering::Relaxed);
+        self.uploads_enabled.store(allowed, Ordering::Relaxed);
+        if allowed {
+            tracing::info!(max_allowed_packet = value, "skill uploads enabled");
+        } else {
+            tracing::error!(
+                max_allowed_packet = value,
+                limit = PACKAGE_MAX_BYTES,
+                "skill uploads disabled: max_allowed_packet must be greater than 16 MiB"
+            );
+        }
+        Ok(())
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -62,6 +111,10 @@ impl Db {
             (
                 "003_json_to_longtext.sql",
                 include_str!("../migrations/003_json_to_longtext.sql"),
+            ),
+            (
+                "004_skill_catalog.sql",
+                include_str!("../migrations/004_skill_catalog.sql"),
             ),
         ] {
             for stmt in split_sql(sql) {
@@ -416,6 +469,37 @@ fn decode_config(r: sqlx::mysql::MySqlRow) -> Result<NodeConfig> {
     })
 }
 
+async fn read_max_allowed_packet(pool: &Pool<MySql>) -> Result<u64> {
+    let row = sqlx::query("SELECT @@GLOBAL.max_allowed_packet AS max_allowed_packet")
+        .fetch_one(pool)
+        .await
+        .context("read @@GLOBAL.max_allowed_packet")?;
+    mysql_u64(&row, "max_allowed_packet").context("parse @@GLOBAL.max_allowed_packet")
+}
+
+fn mysql_u64(row: &sqlx::mysql::MySqlRow, column: &str) -> Result<u64> {
+    if let Ok(value) = row.try_get::<i64, _>(column) {
+        return u64::try_from(value).context("negative integer");
+    }
+    if let Ok(value) = row.try_get::<u64, _>(column) {
+        return Ok(value);
+    }
+    if let Ok(value) = row.try_get::<u32, _>(column) {
+        return Ok(u64::from(value));
+    }
+    if let Ok(value) = row.try_get::<i32, _>(column) {
+        return u64::try_from(value).context("negative integer");
+    }
+    if let Ok(value) = row.try_get::<String, _>(column) {
+        return value.trim().parse().context("integer string");
+    }
+    if let Ok(value) = row.try_get::<Vec<u8>, _>(column) {
+        let text = String::from_utf8(value).context("utf-8")?;
+        return text.trim().parse().context("integer bytes");
+    }
+    anyhow::bail!("unsupported max_allowed_packet type")
+}
+
 fn split_sql(sql: &str) -> Vec<&str> {
     sql.split(';')
         .map(str::trim)
@@ -441,6 +525,9 @@ pub(crate) async fn connect_test_db() -> Option<Db> {
         .await
         .expect("connect NOVBOT_TEST_DATABASE_URL");
     db.migrate().await.expect("migrate");
+    db.check_max_allowed_packet()
+        .await
+        .expect("max_allowed_packet");
     Some(db)
 }
 
@@ -448,6 +535,13 @@ pub(crate) async fn connect_test_db() -> Option<Db> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn uploads_allowed_requires_packet_larger_than_16_mib() {
+        assert!(!uploads_allowed(16 * 1024 * 1024));
+        assert!(uploads_allowed(16 * 1024 * 1024 + 1));
+        assert!(uploads_allowed(64 * 1024 * 1024));
+    }
 
     async fn fetch_node(db: &Db, id: &str) -> NodeRow {
         db.list_nodes()
