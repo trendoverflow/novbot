@@ -37,6 +37,19 @@ pub fn cap_policy_package() -> Vec<u8> {
     pack_example("cap-violation-test", true)
 }
 
+/// Packed observability example under `examples/{name}`.
+///
+/// `name` is `cpu-usage`, `memory-usage`, `disk-usage`, `process-top`, or
+/// `net-interface-traffic`. The node test copy of this file does not call it.
+#[allow(dead_code)]
+pub fn example_package(name: &str) -> Vec<u8> {
+    match name {
+        "cpu-usage" | "memory-usage" | "disk-usage" | "process-top" | "net-interface-traffic" => {}
+        other => panic!("unknown observability example {other}"),
+    }
+    pack_example(name, false)
+}
+
 /// Text `os-release-check` should report, plus a temp fixture when the host
 /// has no `/etc/os-release`. The caller installs `fixture` on the runtime.
 pub struct OsReleaseFile {

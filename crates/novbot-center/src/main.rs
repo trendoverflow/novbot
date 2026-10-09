@@ -12,6 +12,8 @@ mod skill_delivery;
 mod skill_desired;
 
 #[cfg(test)]
+mod d10_21;
+#[cfg(test)]
 mod d10_7;
 #[cfg(test)]
 mod d10_execute;

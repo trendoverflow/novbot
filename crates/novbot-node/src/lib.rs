@@ -10,4 +10,6 @@ pub mod skills;
 mod hub_run;
 
 pub use execute::{apply_dispatch_overlay, execute_spec};
-pub use novbot_skill_runtime::set_missing_os_release_fixture;
+pub use novbot_skill_runtime::{
+    set_missing_os_release_fixture, set_observe_fixture, ObserveFixture,
+};

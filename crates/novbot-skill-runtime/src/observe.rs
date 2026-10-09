@@ -38,6 +38,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SKIP_FSTYPE: &[&str] = &[
@@ -109,7 +110,44 @@ struct IfaceCounters {
     tx_errors: u64,
 }
 
+/// Test-only JSON stand-in for the live `/proc` collectors.
+///
+/// A set field is returned as that collector's body and `/proc` is not read.
+/// An unset override, or an unset field, keeps the production path. Parser
+/// unit tests keep feeding in-memory fixture text into the parse functions.
+#[derive(Clone, Debug, Default)]
+pub struct ObserveFixture {
+    pub metrics: Option<String>,
+    pub processes: Option<String>,
+    pub interfaces: Option<String>,
+}
+
+/// Install or clear the process-wide observe override.
+///
+/// `None` clears it. Production reads stay on `/proc` while the override is unset.
+pub fn set_observe_fixture(fixture: Option<ObserveFixture>) {
+    let mut slot = observe_fixture_slot()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *slot = fixture;
+}
+
+fn fixture_text(pick: impl FnOnce(&ObserveFixture) -> Option<String>) -> Option<String> {
+    let slot = observe_fixture_slot()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    slot.as_ref().and_then(pick)
+}
+
+fn observe_fixture_slot() -> &'static Mutex<Option<ObserveFixture>> {
+    static SLOT: Mutex<Option<ObserveFixture>> = Mutex::new(None);
+    &SLOT
+}
+
 pub(crate) fn metrics_json() -> Result<String, String> {
+    if let Some(text) = fixture_text(|item| item.metrics.clone()) {
+        return Ok(text);
+    }
     let stat_path = Path::new("/proc/stat");
     let mem_path = Path::new("/proc/meminfo");
     if !stat_path.is_file() || !mem_path.is_file() {
@@ -133,6 +171,9 @@ pub(crate) fn metrics_json() -> Result<String, String> {
 }
 
 pub(crate) fn processes_json() -> Result<String, String> {
+    if let Some(text) = fixture_text(|item| item.processes.clone()) {
+        return Ok(text);
+    }
     let root = Path::new("/proc");
     if !root.join("stat").is_file() {
         return Err("proc is not available".into());
@@ -142,6 +183,9 @@ pub(crate) fn processes_json() -> Result<String, String> {
 }
 
 pub(crate) fn interfaces_json() -> Result<String, String> {
+    if let Some(text) = fixture_text(|item| item.interfaces.clone()) {
+        return Ok(text);
+    }
     let dev = Path::new("/proc/net/dev");
     if !dev.is_file() {
         return Err("proc net dev is not available".into());
@@ -919,7 +963,34 @@ Inter-|   Receive                                                |  Transmit
     }
 
     #[test]
+    fn fixture_json_replaces_live_collectors_until_cleared() {
+        let _guard = live_collector_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let metrics =
+            r#"{"cpu":{"usage_percent":1.5},"memory":{"total_bytes":8},"disks":[{"mount":"/"}]}"#;
+        let processes = r#"{"processes":[{"pid":1,"name":"init"}]}"#;
+        let interfaces = r#"{"interfaces":[{"name":"eth0","rx_bytes":10,"tx_bytes":20}]}"#;
+        set_observe_fixture(Some(ObserveFixture {
+            metrics: Some(metrics.to_string()),
+            processes: Some(processes.to_string()),
+            interfaces: Some(interfaces.to_string()),
+        }));
+        let _clear = ClearObserveFixture;
+        assert_eq!(metrics_json().as_deref(), Ok(metrics));
+        assert_eq!(processes_json().as_deref(), Ok(processes));
+        assert_eq!(interfaces_json().as_deref(), Ok(interfaces));
+        set_observe_fixture(None);
+        assert_ne!(metrics_json().unwrap_or_default(), metrics);
+        assert_ne!(processes_json().unwrap_or_default(), processes);
+        assert_ne!(interfaces_json().unwrap_or_default(), interfaces);
+    }
+
+    #[test]
     fn live_collectors_error_when_proc_is_absent() {
+        let _guard = live_collector_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         if !Path::new("/proc/stat").is_file() {
             let err = metrics_json().unwrap_err();
             assert!(err.contains("proc"), "{err}");
@@ -930,6 +1001,19 @@ Inter-|   Receive                                                |  Transmit
             let err = interfaces_json().unwrap_err();
             assert!(err.contains("proc"), "{err}");
         }
+    }
+
+    struct ClearObserveFixture;
+
+    impl Drop for ClearObserveFixture {
+        fn drop(&mut self) {
+            set_observe_fixture(None);
+        }
+    }
+
+    fn live_collector_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        &LOCK
     }
 
     #[test]

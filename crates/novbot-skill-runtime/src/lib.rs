@@ -16,6 +16,7 @@ mod wasi_deny;
 
 pub use grant::{CapabilityDef, DenialReason, ScopeRequirement, CAPABILITIES};
 pub use host::{run, set_missing_os_release_fixture, RunRequest, SkillRuntime};
+pub use observe::{set_observe_fixture, ObserveFixture};
 
 use serde::Serialize;
 

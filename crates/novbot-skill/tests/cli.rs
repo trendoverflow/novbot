@@ -99,6 +99,8 @@ fn examples_are_distinct_and_cap_violations_match() {
         "listening-ports",
         "cap-violation-test",
         "cpu-usage",
+        "memory-usage",
+        "disk-usage",
         "process-top",
         "net-interface-traffic",
     ];
@@ -209,6 +211,12 @@ fn assert_cap_violation(project: &Path) {
 fn assert_observability_examples(examples: &Path) {
     let cases = [
         ("cpu-usage", "cpu-usage-1.0.0.nbskill", "sys.metrics.read"),
+        (
+            "memory-usage",
+            "memory-usage-1.0.0.nbskill",
+            "sys.metrics.read",
+        ),
+        ("disk-usage", "disk-usage-1.0.0.nbskill", "sys.metrics.read"),
         ("process-top", "process-top-1.0.0.nbskill", "proc.list.read"),
         (
             "net-interface-traffic",
@@ -240,6 +248,15 @@ fn assert_observability_examples(examples: &Path) {
             }
             if dir == "cpu-usage" {
                 assert!(payload.get("cpu_usage_percent").is_some(), "{payload}");
+            }
+            if dir == "memory-usage" {
+                assert!(payload.get("total_bytes").is_some(), "{payload}");
+                assert!(payload.get("used_bytes").is_some(), "{payload}");
+                assert!(payload.get("available_bytes").is_some(), "{payload}");
+            }
+            if dir == "disk-usage" {
+                let disks = payload["disks"].as_array().expect("disks");
+                assert!(disks.iter().any(|disk| disk["mount"] == "/"), "{payload}");
             }
             if dir == "net-interface-traffic" {
                 assert!(payload["interfaces"].is_array(), "{payload}");
