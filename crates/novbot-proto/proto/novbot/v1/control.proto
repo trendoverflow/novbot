@@ -15,6 +15,7 @@ message ClientMessage {
     PullConfigRequest pull_config = 12;
     ReportResultRequest report_result = 13;
     Ack ack = 14;
+    NodeReady node_ready = 15;
   }
 }
 
@@ -55,6 +56,12 @@ message HeartbeatRequest {
 message HeartbeatResponse {
   bool ok = 1;
   int64 center_config_generation = 2;
+}
+
+message NodeReady {
+  string node_id = 1;
+  // Config generation the node has applied in memory.
+  int64 config_generation = 2;
 }
 
 message PullConfigRequest {

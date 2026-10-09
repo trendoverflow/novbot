@@ -1,7 +1,7 @@
 // Copyright 2026 TrendOverflow / NovHub
 // SPDX-License-Identifier: Apache-2.0
 
-//! Node daemon: Register → PullConfig (memory) → schedule probes → ReportResult + retry spool + single-file egress.
+//! Node daemon: Register → PullConfig (memory) → NodeReady → schedule probes → ReportResult + retry spool + single-file egress.
 //! Control.Session disconnects reconnect with exponential backoff; the process stays alive (M12).
 
 mod config;
@@ -17,8 +17,8 @@ use novbot_core::{
 };
 use novbot_proto::control_client::ControlClient;
 use novbot_proto::{
-    client_message, server_message, ClientMessage, Dispatch, HeartbeatRequest, PullConfigRequest,
-    RegisterRequest, ReportResultRequest, ServerMessage,
+    client_message, server_message, ClientMessage, Dispatch, HeartbeatRequest, NodeReady,
+    PullConfigRequest, RegisterRequest, ReportResultRequest, ServerMessage,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -80,6 +80,9 @@ struct RuntimeState {
     specs: HashMap<String, Spec>,
     schedules: Vec<Schedule>,
     config_generation: i64,
+    /// True after this process has applied a config. Not inferred from
+    /// `config_generation`: generation 0 can be a real applied config.
+    config_loaded: bool,
     last_run: HashMap<String, u64>,
 }
 
@@ -428,6 +431,7 @@ async fn on_server(
                 policy,
             )
             .await?;
+            send_node_ready(node_id, state, out).await;
         }
         server_message::Body::PushConfig(push) => {
             let schedules_json = {
@@ -442,6 +446,7 @@ async fn on_server(
                 policy,
             )
             .await?;
+            send_node_ready(node_id, state, out).await;
         }
         server_message::Body::PushSchedule(push) => {
             let mut st = state.write().await;
@@ -486,6 +491,7 @@ async fn apply_config(
     st.specs = specs.into_iter().map(|s| (s.id.clone(), s)).collect();
     st.schedules = schedules;
     st.config_generation = generation;
+    st.config_loaded = true;
     tracing::info!(
         generation,
         specs = st.specs.len(),
@@ -493,6 +499,29 @@ async fn apply_config(
         "config applied in memory"
     );
     Ok(())
+}
+
+async fn send_node_ready(node_id: &str, state: &Arc<RwLock<RuntimeState>>, out: &SessionOut) {
+    let generation = state.read().await.config_generation;
+    let sent = try_send(
+        out,
+        ClientMessage {
+            request_id: Uuid::new_v4().to_string(),
+            body: Some(client_message::Body::NodeReady(NodeReady {
+                node_id: node_id.to_string(),
+                config_generation: generation,
+            })),
+        },
+    )
+    .await;
+    if sent {
+        tracing::info!(generation, "config applied; sent NodeReady");
+    } else {
+        tracing::warn!(
+            generation,
+            "config applied; NodeReady not sent (session not connected)"
+        );
+    }
 }
 
 async fn run_due(
@@ -580,42 +609,68 @@ async fn run_dispatch(
     d: &Dispatch,
     policy: ProbePolicy,
 ) -> Result<()> {
-    let mut spec = {
-        let st = state.read().await;
-        st.specs
-            .get(&d.spec_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("dispatch unknown spec_id: {}", d.spec_id))?
-    };
-    if !d.params_json.trim().is_empty() {
-        if let Ok(overlay) = serde_json::from_str::<serde_json::Value>(&d.params_json) {
-            if let Some(obj) = overlay.as_object() {
-                if !spec.params.is_object() {
-                    spec.params = json!({});
-                }
-                let base = spec.params.as_object_mut().unwrap();
-                for (k, v) in obj {
-                    base.insert(k.clone(), v.clone());
-                }
-            }
-        }
-    }
-
+    // A dispatch that cannot run still reports failed (same shape as exec_disabled)
+    // so the run is never dropped.
     let run_id = if d.run_id.is_empty() {
         Uuid::new_v4().to_string()
     } else {
         d.run_id.clone()
     };
-    let observed_at = Utc::now().timestamp_millis();
-    let (status, payload) = match run_probe(&spec, &policy).await {
-        Ok(out) => (out.status.to_string(), out.payload),
-        Err(e) => ("error".to_string(), json!({"error": e.to_string()})),
+    let prep = {
+        let st = state.read().await;
+        if !st.config_loaded {
+            Err("config_not_ready")
+        } else if let Some(spec) = st.specs.get(&d.spec_id).cloned() {
+            Ok(spec)
+        } else {
+            Err("spec_not_found")
+        }
+    };
+    let (spec_id, status, payload, observed_at) = match prep {
+        Err(reason) => {
+            tracing::warn!(
+                run_id = %run_id,
+                spec_id = %d.spec_id,
+                %reason,
+                "dispatch cannot run"
+            );
+            (
+                d.spec_id.clone(),
+                "failed".to_string(),
+                json!({
+                    "reason": reason,
+                    "spec_id": d.spec_id,
+                }),
+                Utc::now().timestamp_millis(),
+            )
+        }
+        Ok(mut spec) => {
+            if !d.params_json.trim().is_empty() {
+                if let Ok(overlay) = serde_json::from_str::<serde_json::Value>(&d.params_json) {
+                    if let Some(obj) = overlay.as_object() {
+                        if !spec.params.is_object() {
+                            spec.params = json!({});
+                        }
+                        let base = spec.params.as_object_mut().unwrap();
+                        for (k, v) in obj {
+                            base.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            let observed_at = Utc::now().timestamp_millis();
+            let (status, payload) = match run_probe(&spec, &policy).await {
+                Ok(out) => (out.status.to_string(), out.payload),
+                Err(e) => ("error".to_string(), json!({"error": e.to_string()})),
+            };
+            (spec.id, status, payload, observed_at)
+        }
     };
     let payload_json = serde_json::to_string(&payload)?;
     let egress = json!({
         "node_id": node_id,
         "run_id": run_id,
-        "spec_id": spec.id,
+        "spec_id": spec_id,
         "status": status,
         "payload": payload,
         "observed_at_unix_ms": observed_at,
@@ -628,7 +683,7 @@ async fn run_dispatch(
     let pending = PendingReport {
         node_id: node_id.to_string(),
         run_id: run_id.clone(),
-        spec_id: spec.id.clone(),
+        spec_id: spec_id.clone(),
         status: status.clone(),
         payload_json: payload_json.clone(),
         observed_at_unix_ms: observed_at,
@@ -639,7 +694,7 @@ async fn run_dispatch(
         body: Some(client_message::Body::ReportResult(ReportResultRequest {
             node_id: node_id.to_string(),
             run_id,
-            spec_id: spec.id,
+            spec_id,
             status,
             payload_json,
             observed_at_unix_ms: observed_at,
@@ -835,5 +890,211 @@ mod exec_gate_tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "failed");
         assert_exec_disabled(&items[0].payload_json, &marker);
+    }
+}
+
+#[cfg(test)]
+mod dispatch_ready_tests {
+    use super::{apply_config, on_server, run_dispatch, RuntimeState, SessionOut};
+    use novbot_core::{ProbePolicy, RetrySpool};
+    use novbot_proto::{
+        client_message, server_message, Dispatch, PullConfigResponse, ServerMessage,
+    };
+    use std::sync::Arc;
+    use tokio::sync::{mpsc, RwLock};
+
+    fn skill_specs(spec_id: &str) -> String {
+        serde_json::json!([{
+            "id": spec_id,
+            "kind": "skill",
+            "params": {"skill": "host_info"}
+        }])
+        .to_string()
+    }
+
+    fn assert_failed_payload(payload_json: &str, reason: &str, spec_id: &str) {
+        let payload: serde_json::Value = serde_json::from_str(payload_json).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({ "reason": reason, "spec_id": spec_id })
+        );
+    }
+
+    struct Harness {
+        _data: tempfile::TempDir,
+        data_dir: std::path::PathBuf,
+        spool: Arc<RetrySpool>,
+        state: Arc<RwLock<RuntimeState>>,
+        out: SessionOut,
+    }
+
+    fn harness() -> Harness {
+        let data = tempfile::tempdir().unwrap();
+        let data_dir = data.path().to_path_buf();
+        let spool = Arc::new(RetrySpool::new(&data_dir));
+        let state = Arc::new(RwLock::new(RuntimeState::default()));
+        let out: SessionOut = Arc::new(RwLock::new(None));
+        Harness {
+            _data: data,
+            data_dir,
+            spool,
+            state,
+            out,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_before_config_reports_config_not_ready() {
+        let h = harness();
+        let dispatch = Dispatch {
+            run_id: "run-keep".into(),
+            spec_id: "host-skill".into(),
+            params_json: "{}".into(),
+        };
+        let result = run_dispatch(
+            "node-1",
+            &h.state,
+            &h.spool,
+            &h.data_dir,
+            &h.out,
+            &dispatch,
+            ProbePolicy::default(),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let items = h.spool.drain().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "failed");
+        assert_eq!(items[0].run_id, "run-keep");
+        assert_eq!(items[0].spec_id, "host-skill");
+        assert_failed_payload(&items[0].payload_json, "config_not_ready", "host-skill");
+
+        let egress: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(h.data_dir.join("last_result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(egress["source"], "dispatch");
+        assert_eq!(egress["status"], "failed");
+        assert_eq!(egress["run_id"], "run-keep");
+        assert_eq!(egress["payload"]["reason"], "config_not_ready");
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_spec_reports_spec_not_found() {
+        let h = harness();
+        apply_config(
+            &h.state,
+            1,
+            &skill_specs("host-skill"),
+            "[]",
+            ProbePolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        let dispatch = Dispatch {
+            run_id: "run-missing".into(),
+            spec_id: "other-spec".into(),
+            params_json: "{}".into(),
+        };
+        let result = run_dispatch(
+            "node-1",
+            &h.state,
+            &h.spool,
+            &h.data_dir,
+            &h.out,
+            &dispatch,
+            ProbePolicy::default(),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let items = h.spool.drain().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "failed");
+        assert_eq!(items[0].run_id, "run-missing");
+        assert_eq!(items[0].spec_id, "other-spec");
+        assert_failed_payload(&items[0].payload_json, "spec_not_found", "other-spec");
+    }
+
+    #[tokio::test]
+    async fn pull_config_sends_node_ready_after_apply() {
+        let h = harness();
+        let (tx, mut rx) = mpsc::channel(4);
+        *h.out.write().await = Some(tx);
+        let msg = ServerMessage {
+            request_id: "pull-1".into(),
+            body: Some(server_message::Body::PullConfig(PullConfigResponse {
+                config_generation: 7,
+                specs_json: skill_specs("host-skill"),
+                schedules_json: "[]".into(),
+            })),
+        };
+        on_server(
+            "node-1",
+            &h.state,
+            &h.spool,
+            &h.data_dir,
+            &h.out,
+            ProbePolicy::default(),
+            msg,
+        )
+        .await
+        .unwrap();
+
+        {
+            let st = h.state.read().await;
+            assert!(st.config_loaded);
+            assert_eq!(st.config_generation, 7);
+            assert!(st.specs.contains_key("host-skill"));
+        }
+
+        let sent = rx.try_recv().expect("NodeReady");
+        assert!(rx.try_recv().is_err(), "unexpected extra client message");
+        match sent.body {
+            Some(client_message::Body::NodeReady(ready)) => {
+                assert_eq!(ready.node_id, "node-1");
+                assert_eq!(ready.config_generation, 7);
+            }
+            other => panic!("expected NodeReady, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_dispatch_after_config_runs_ok() {
+        let h = harness();
+        apply_config(
+            &h.state,
+            2,
+            &skill_specs("host-skill"),
+            "[]",
+            ProbePolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        let dispatch = Dispatch {
+            run_id: "run-ok".into(),
+            spec_id: "host-skill".into(),
+            params_json: String::new(),
+        };
+        let result = run_dispatch(
+            "node-1",
+            &h.state,
+            &h.spool,
+            &h.data_dir,
+            &h.out,
+            &dispatch,
+            ProbePolicy::default(),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let items = h.spool.drain().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "ok");
+        assert_eq!(items[0].run_id, "run-ok");
+        assert_eq!(items[0].spec_id, "host-skill");
     }
 }
