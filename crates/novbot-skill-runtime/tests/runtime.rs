@@ -28,6 +28,8 @@ fn invoke(
             grants,
             params_json: &params_json,
             data_dir,
+            timeout: None,
+            memory_bytes: None,
         },
     );
     serde_json::to_value(&output).expect("json")
@@ -269,4 +271,61 @@ fn wasi_filesystem_is_undeclared() {
     assert_eq!(json["denials"][0]["capability"], "wasi:filesystem");
     assert_eq!(json["denials"][0]["reason"], "undeclared_capability");
     assert_absent(&json, secret);
+}
+
+#[test]
+fn spinning_guest_hits_exec_timeout() {
+    let started = std::time::Instant::now();
+    let params = json!({"op": "spin"}).to_string();
+    let output = run(
+        runtime(),
+        RunRequest {
+            component_bytes: GUEST,
+            grants: &[],
+            params_json: &params,
+            data_dir: None,
+            timeout: Some(std::time::Duration::from_millis(30)),
+            memory_bytes: None,
+        },
+    );
+    assert_eq!(output.status, "error");
+    assert_eq!(
+        output.error.as_ref().map(|err| err.code.as_str()),
+        Some("exec_timeout")
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "timeout took {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn memory_cap_is_enforced() {
+    let params = json!({"op": "info"}).to_string();
+    let output = run(
+        runtime(),
+        RunRequest {
+            component_bytes: GUEST,
+            grants: &["sys.info.read"],
+            params_json: &params,
+            data_dir: None,
+            timeout: None,
+            memory_bytes: Some(1),
+        },
+    );
+    assert_eq!(output.status, "error");
+    assert_eq!(
+        output.error.as_ref().map(|err| err.code.as_str()),
+        Some("resource_limit")
+    );
+}
+
+#[test]
+fn compile_rejects_serialized_cwasm() {
+    let rt = runtime();
+    let cwasm = rt.compile_cwasm(GUEST).expect("compile guest");
+    assert!(cwasm.len() > 8);
+    let rejected = rt.compile_cwasm(&cwasm).expect_err("cwasm is not input");
+    assert!(rejected.starts_with("compile_failed"), "{rejected}");
 }

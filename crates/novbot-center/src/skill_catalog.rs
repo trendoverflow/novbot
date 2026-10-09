@@ -41,6 +41,7 @@ pub(crate) enum CatalogError {
     CapabilityInvalid(String),
     SkillUnknown,
     VersionUnknown,
+    VersionInUse,
     Internal(anyhow::Error),
 }
 
@@ -64,6 +65,7 @@ impl std::fmt::Display for CatalogError {
             Self::VersionExists => write!(f, "version exists"),
             Self::SkillUnknown => write!(f, "skill unknown"),
             Self::VersionUnknown => write!(f, "version unknown"),
+            Self::VersionInUse => write!(f, "version in use"),
             Self::Internal(err) => write!(f, "{err}"),
         }
     }
@@ -470,6 +472,80 @@ pub(crate) async fn get_version(
         min_node_version: found.min_node_version,
         platforms: found.platforms,
     })
+}
+
+pub(crate) async fn delete_version(db: &Db, name: &str, version: &str) -> Result<(), CatalogError> {
+    let mut tx = db.pool().begin().await.map_err(internal)?;
+    let Some(skill_id) = lock_skill(tx.deref_mut(), name).await? else {
+        return Err(CatalogError::SkillUnknown);
+    };
+    let row = sqlx::query(
+        "SELECT sha256 FROM skill_versions WHERE skill_id = ? AND version = ? FOR UPDATE",
+    )
+    .bind(skill_id)
+    .bind(version)
+    .fetch_optional(tx.deref_mut())
+    .await
+    .map_err(|err| db_err(err, "lock skill version"))?;
+    let Some(row) = row else {
+        return Err(CatalogError::VersionUnknown);
+    };
+    let sha256 = trim_hex(row.try_get("sha256").map_err(internal)?);
+    if version_in_use(tx.deref_mut(), name, version).await? {
+        return Err(CatalogError::VersionInUse);
+    }
+    sqlx::query("DELETE FROM skill_versions WHERE skill_id = ? AND version = ?")
+        .bind(skill_id)
+        .bind(version)
+        .execute(tx.deref_mut())
+        .await
+        .map_err(|err| db_err(err, "delete skill version"))?;
+    let still = sqlx::query("SELECT sha256 FROM skill_versions WHERE sha256 = ? LIMIT 1")
+        .bind(&sha256)
+        .fetch_optional(tx.deref_mut())
+        .await
+        .map_err(|err| db_err(err, "lookup artifact users"))?;
+    if still.is_none() {
+        sqlx::query("DELETE FROM skill_artifacts WHERE sha256 = ?")
+            .bind(&sha256)
+            .execute(tx.deref_mut())
+            .await
+            .map_err(|err| db_err(err, "delete artifact"))?;
+    }
+    tx.commit().await.map_err(internal)?;
+    Ok(())
+}
+
+async fn version_in_use(
+    conn: &mut MySqlConnection,
+    name: &str,
+    version: &str,
+) -> Result<bool, CatalogError> {
+    for (sql, ctx) in [
+        (
+            "SELECT node_id FROM node_skills_desired WHERE skill_name = ? AND version = ? LIMIT 1",
+            "desired version in use",
+        ),
+        (
+            "SELECT node_id FROM node_skills_actual WHERE skill_name = ? AND version = ? LIMIT 1",
+            "actual version in use",
+        ),
+        (
+            "SELECT bundle_id FROM skill_bundle_items WHERE skill_name = ? AND version_req = ? LIMIT 1",
+            "bundle version in use",
+        ),
+    ] {
+        let row = sqlx::query(sql)
+            .bind(name)
+            .bind(version)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|err| db_err(err, ctx))?;
+        if row.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) async fn read_package(

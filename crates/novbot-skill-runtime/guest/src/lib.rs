@@ -90,6 +90,17 @@ impl Guest for SkillGuest {
                 }
                 Ok("finished".to_string())
             }
+            "spin" => {
+                // Side effect keeps the loop in the wasm so epoch interruption can fire.
+                let mut n: u64 = 1;
+                loop {
+                    n = n.wrapping_mul(3).wrapping_add(1);
+                    if n == 0 {
+                        break;
+                    }
+                }
+                Ok(n.to_string())
+            }
             other => Err(format!("unknown op: {other}")),
         }
     }

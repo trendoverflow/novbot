@@ -5,6 +5,7 @@ use crate::db::{Db, NodeConfig, NodeRow, ResultRow};
 use crate::hub::Hub;
 use crate::skill_bundles;
 use crate::skill_catalog::{self, HubSkillItem, SkillDetail, VersionDetail};
+use crate::skill_delivery;
 use crate::skill_desired;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -55,7 +56,10 @@ pub fn router(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
         )
         .route("/skills/{name}", get(get_skill))
-        .route("/skills/{name}/versions/{version}", get(get_skill_version))
+        .route(
+            "/skills/{name}/versions/{version}",
+            get(get_skill_version).delete(delete_skill_version),
+        )
         .route(
             "/skills/{name}/versions/{version}/package",
             get(get_skill_package),
@@ -212,6 +216,9 @@ async fn install_skill(
     Json(body): Json<skill_desired::InstallRequest>,
 ) -> Result<(StatusCode, Json<skill_desired::ChangeResponse>), ApiError> {
     let response = skill_desired::install(&st.db, &st.hub, &name, body).await?;
+    if !response.dry_run {
+        fanout_pending(&st, &response.per_node).await;
+    }
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -221,6 +228,9 @@ async fn rollback_skill(
     Json(body): Json<skill_desired::RollbackRequest>,
 ) -> Result<(StatusCode, Json<skill_desired::ChangeResponse>), ApiError> {
     let response = skill_desired::rollback(&st.db, &st.hub, &name, body).await?;
+    if !response.dry_run {
+        fanout_pending(&st, &response.per_node).await;
+    }
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -230,7 +240,30 @@ async fn uninstall_skill(
     Json(body): Json<skill_desired::UninstallRequest>,
 ) -> Result<(StatusCode, Json<skill_desired::ChangeResponse>), ApiError> {
     let response = skill_desired::uninstall(&st.db, &st.hub, &name, body).await?;
+    if !response.dry_run {
+        fanout_pending(&st, &response.per_node).await;
+    }
     Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn delete_skill_version(
+    State(st): State<AppState>,
+    Path((name, version)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    skill_catalog::delete_version(&st.db, &name, &version).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn fanout_pending(st: &AppState, per_node: &[skill_desired::PerNode]) {
+    let ids: Vec<String> = per_node
+        .iter()
+        .filter(|node| node.outcome == "pending")
+        .map(|node| node.node_id.clone())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    skill_delivery::push_pending(&st.db, &st.hub, &ids).await;
 }
 
 async fn list_skill_operations(
@@ -313,7 +346,19 @@ async fn install_skill_bundle(
     Path(id): Path<String>,
     Json(body): Json<skill_bundles::BundleInstallRequest>,
 ) -> Result<(StatusCode, Json<skill_bundles::BundleInstallResponse>), ApiError> {
+    let dry_run = body.dry_run;
     let response = skill_bundles::install_bundle(&st.db, &st.hub, &id, body).await?;
+    if !dry_run {
+        let mut ids = Vec::new();
+        for operation in &response.operations {
+            for node in &operation.per_node {
+                if node.outcome == "pending" {
+                    ids.push(node.node_id.clone());
+                }
+            }
+        }
+        skill_delivery::push_pending(&st.db, &st.hub, &ids).await;
+    }
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
@@ -906,6 +951,11 @@ impl From<skill_catalog::CatalogError> for ApiError {
                 StatusCode::NOT_FOUND,
                 "version_unknown",
                 "unknown skill version",
+            ),
+            VersionInUse => ApiError::coded(
+                StatusCode::CONFLICT,
+                "version_in_use",
+                "skill version is still desired, reported, or pinned by a bundle",
             ),
             Internal(err) => ApiError::from(err),
         }

@@ -8,7 +8,11 @@ mod http;
 mod hub;
 mod skill_bundles;
 mod skill_catalog;
+mod skill_delivery;
 mod skill_desired;
+
+#[cfg(test)]
+mod d10_7;
 
 use anyhow::Context;
 use clap::Parser;

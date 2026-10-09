@@ -684,7 +684,7 @@ pub(crate) async fn node_skills(
     .await
     .map_err(db_err)?;
     let actual_rows = sqlx::query(
-        "SELECT skill_name, version, sha256, state FROM node_skills_actual WHERE node_id = ?",
+        "SELECT skill_name, version, sha256, state, applied_generation FROM node_skills_actual WHERE node_id = ?",
     )
     .bind(node_id)
     .fetch_all(db.pool())
@@ -699,6 +699,7 @@ pub(crate) async fn node_skills(
                 version: row.try_get("version").map_err(db_err)?,
                 sha256: trim_text(row.try_get("sha256").map_err(db_err)?),
                 state: row.try_get("state").map_err(db_err)?,
+                applied_generation: row.try_get("applied_generation").map_err(db_err)?,
             },
         );
     }
@@ -718,7 +719,7 @@ pub(crate) async fn node_skills(
         let version: String = row.try_get("version").map_err(db_err)?;
         let sha256 = trim_text(row.try_get("sha256").map_err(db_err)?);
         let actual = actuals.get(&name);
-        let state = derived_state(connected, &sha256, actual);
+        let state = derived_state(connected, &sha256, generation, actual);
         items.push(NodeSkillItem {
             name,
             source: "hub".to_string(),
@@ -739,12 +740,21 @@ struct ActualSnap {
     version: String,
     sha256: String,
     state: String,
+    applied_generation: i64,
 }
 
-fn derived_state(connected: bool, desired_sha: &str, actual: Option<&ActualSnap>) -> &'static str {
+fn derived_state(
+    connected: bool,
+    desired_sha: &str,
+    generation: i64,
+    actual: Option<&ActualSnap>,
+) -> &'static str {
     if let Some(actual) = actual {
         if actual.state == "installed" && actual.sha256.eq_ignore_ascii_case(desired_sha) {
             return "installed";
+        }
+        if actual.state == "failed" && actual.applied_generation == generation {
+            return "failed";
         }
     }
     if connected {
@@ -1301,6 +1311,41 @@ async fn append_audit(
     node_id: Option<String>,
     detail_json: &str,
 ) -> Result<(), DesiredError> {
+    append_audit_as(tx, ACTOR, ACTOR, action, target_id, node_id, detail_json).await
+}
+
+pub(crate) async fn lock_audit_chain(tx: &mut Transaction<'_, MySql>) -> Result<(), DesiredError> {
+    lock_chain(tx).await
+}
+
+pub(crate) async fn append_node_audit(
+    tx: &mut Transaction<'_, MySql>,
+    node_id: &str,
+    action: &str,
+    target_id: &str,
+    detail_json: &str,
+) -> Result<(), DesiredError> {
+    append_audit_as(
+        tx,
+        "node",
+        node_id,
+        action,
+        target_id,
+        Some(node_id.to_string()),
+        detail_json,
+    )
+    .await
+}
+
+async fn append_audit_as(
+    tx: &mut Transaction<'_, MySql>,
+    actor_type: &str,
+    actor_id: &str,
+    action: &str,
+    target_id: &str,
+    node_id: Option<String>,
+    detail_json: &str,
+) -> Result<(), DesiredError> {
     let prev = sqlx::query("SELECT `hash` FROM audit_events ORDER BY id DESC LIMIT 1")
         .fetch_optional(tx.deref_mut())
         .await
@@ -1325,8 +1370,8 @@ async fn append_audit(
         )
         "#,
     )
-    .bind(ACTOR)
-    .bind(ACTOR)
+    .bind(actor_type)
+    .bind(actor_id)
     .bind(action)
     .bind(target_id)
     .bind(node_id)

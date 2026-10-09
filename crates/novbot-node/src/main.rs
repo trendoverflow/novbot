@@ -1,7 +1,8 @@
 // Copyright 2026 TrendOverflow / NovHub
 // SPDX-License-Identifier: Apache-2.0
 
-//! Node daemon: Register → PullConfig (memory) → NodeReady → schedule probes → ReportResult + retry spool + single-file egress.
+//! Node daemon: Register → PullSkills → reconcile → SkillStateReport → PullConfig → NodeReady
+//! → schedule probes → ReportResult + retry spool + single-file egress.
 //! Control.Session disconnects reconnect with exponential backoff; the process stays alive (M12).
 
 mod config;
@@ -15,10 +16,11 @@ use novbot_core::{
     due_specs, parse_schedules_json, parse_specs_json, run_probe, write_egress_result,
     PendingReport, ProbePolicy, RetrySpool, Schedule, Spec, SpecKind,
 };
+use novbot_node::skills::{DesiredSet, GrpcArtifactSource, InstallLimits, SkillHost, ABI, CATALOG};
 use novbot_proto::control_client::ControlClient;
 use novbot_proto::{
     client_message, server_message, ClientMessage, Dispatch, HeartbeatRequest, NodeReady,
-    PullConfigRequest, RegisterRequest, ReportResultRequest, ServerMessage,
+    PullConfigRequest, PullSkillsRequest, RegisterRequest, ReportResultRequest, ServerMessage,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -139,8 +141,18 @@ async fn main() -> Result<()> {
         allow_exec: cfg.allow_exec.value,
     };
     resolve_center_dns(&cfg.center_grpc.value).await;
+    warn_plaintext_skills(&cfg.center_grpc.value);
 
     tokio::fs::create_dir_all(&args.data_dir).await?;
+    let skill_source = Arc::new(GrpcArtifactSource::new(
+        cfg.center_grpc.value.uri.clone(),
+        cfg.node_id.value.clone(),
+    ));
+    let skills = Arc::new(
+        SkillHost::open(&args.data_dir, skill_source, InstallLimits::default())
+            .await
+            .context("open skill store")?,
+    );
     let node_id = cfg.node_id.value.clone();
     let hostname = hostname::get()
         .ok()
@@ -155,12 +167,14 @@ async fn main() -> Result<()> {
         let out = session_out.clone();
         let node_id = node_id.clone();
         let state = state.clone();
+        let skills = skills.clone();
         let every = Duration::from_secs(args.heartbeat_secs.max(5));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(every);
             loop {
                 ticker.tick().await;
                 let gen = state.read().await.config_generation;
+                let skill_gen = skills.applied_generation();
                 let _ = try_send(
                     &out,
                     ClientMessage {
@@ -168,6 +182,7 @@ async fn main() -> Result<()> {
                         body: Some(client_message::Body::Heartbeat(HeartbeatRequest {
                             node_id: node_id.clone(),
                             config_generation: gen,
+                            skill_set_generation: skill_gen,
                         })),
                     },
                 )
@@ -213,7 +228,18 @@ async fn main() -> Result<()> {
 
     let mut backoff = RECONNECT_MIN;
     loop {
-        match run_session(&args, &cfg, &hostname, &state, &spool, &session_out, policy).await {
+        match run_session(
+            &args,
+            &cfg,
+            &hostname,
+            &state,
+            &spool,
+            &session_out,
+            &skills,
+            policy,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::warn!("control stream closed; will reconnect");
                 backoff = RECONNECT_MIN;
@@ -263,6 +289,20 @@ async fn resolve_center_dns(addr: &config::CenterAddr) {
     }
 }
 
+fn warn_plaintext_skills(addr: &config::CenterAddr) {
+    let loopback = matches!(
+        addr.host.as_str(),
+        "localhost" | "127.0.0.1" | "::1" | "[::1]"
+    );
+    if addr.uri.starts_with("http://") && !loopback {
+        tracing::warn!(
+            address = %addr,
+            "skill packages travel on plaintext gRPC to a non-loopback center"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     args: &Args,
     cfg: &config::NodeConfig,
@@ -270,6 +310,7 @@ async fn run_session(
     state: &Arc<RwLock<RuntimeState>>,
     spool: &Arc<RetrySpool>,
     session_out: &SessionOut,
+    skills: &Arc<SkillHost>,
     policy: ProbePolicy,
 ) -> Result<()> {
     let center = cfg.center_grpc.value.uri.clone();
@@ -300,21 +341,25 @@ async fn run_session(
                 .map(|token| token.value.expose().to_string())
                 .unwrap_or_default(),
             labels: parse_labels(&args.labels),
+            skill_abi: ABI.into(),
+            capabilities_supported: CATALOG.iter().map(|cap| (*cap).to_string()).collect(),
+            skill_set_generation: skills.applied_generation(),
+            installed: skills.register_installed(),
+            supports_ready: true,
         })),
     })
     .await
     .context("send Register")?;
 
-    let known = state.read().await.config_generation;
     tx.send(ClientMessage {
         request_id: Uuid::new_v4().to_string(),
-        body: Some(client_message::Body::PullConfig(PullConfigRequest {
+        body: Some(client_message::Body::PullSkills(PullSkillsRequest {
             node_id: node_id.to_string(),
-            known_generation: known,
+            known_generation: skills.applied_generation(),
         })),
     })
     .await
-    .context("send PullConfig")?;
+    .context("send PullSkills")?;
 
     // Flush any reports queued while disconnected.
     if let Err(e) = flush_spool(spool, session_out).await {
@@ -323,6 +368,7 @@ async fn run_session(
 
     tracing::info!("Control.Session connected");
 
+    let mut pulled_config = false;
     while let Some(frame) = inbound.next().await {
         let msg = match frame {
             Ok(m) => m,
@@ -331,18 +377,39 @@ async fn run_session(
                 break;
             }
         };
-        if let Err(e) = on_server(
-            node_id,
-            state,
-            spool,
-            &args.data_dir,
-            session_out,
-            policy,
-            msg,
-        )
-        .await
-        {
-            tracing::warn!(error = %e, "handle server message failed");
+        match msg.body {
+            Some(server_message::Body::DesiredSkills(desired)) => {
+                let boot = !pulled_config;
+                drive_skills(skills, node_id, desired, session_out, boot).await;
+                if boot {
+                    send_pull_config(node_id, state, session_out).await;
+                    pulled_config = true;
+                }
+            }
+            Some(server_message::Body::Error(err)) if !pulled_config => {
+                tracing::warn!(code = %err.code, "skill pull failed; continuing to config");
+                send_pull_config(node_id, state, session_out).await;
+                pulled_config = true;
+            }
+            body => {
+                if let Err(e) = on_server(
+                    node_id,
+                    state,
+                    spool,
+                    &args.data_dir,
+                    session_out,
+                    skills,
+                    policy,
+                    ServerMessage {
+                        request_id: msg.request_id,
+                        body,
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "handle server message failed");
+                }
+            }
         }
     }
 
@@ -386,12 +453,85 @@ async fn send_report_or_spool(
     Ok(())
 }
 
+async fn send_pull_config(node_id: &str, state: &Arc<RwLock<RuntimeState>>, out: &SessionOut) {
+    let known = state.read().await.config_generation;
+    let _ = try_send(
+        out,
+        ClientMessage {
+            request_id: Uuid::new_v4().to_string(),
+            body: Some(client_message::Body::PullConfig(PullConfigRequest {
+                node_id: node_id.to_string(),
+                known_generation: known,
+            })),
+        },
+    )
+    .await;
+}
+
+async fn drive_skills(
+    skills: &Arc<SkillHost>,
+    node_id: &str,
+    desired: novbot_proto::DesiredSkills,
+    out: &SessionOut,
+    boot: bool,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let host = skills.clone();
+    let set = DesiredSet::from_proto(&desired);
+    tokio::spawn(async move {
+        let snap = host.reconcile(set).await;
+        let _ = tx.send(snap).await;
+    });
+    if !boot {
+        let out = out.clone();
+        let node_id = node_id.to_string();
+        tokio::spawn(async move {
+            if let Some(snap) = rx.recv().await {
+                send_skill_report(&out, &node_id, &snap).await;
+            }
+        });
+        return;
+    }
+    let bound = skills.ready_bound();
+    match tokio::time::timeout(bound, rx.recv()).await {
+        Ok(Some(snap)) => send_skill_report(out, node_id, &snap).await,
+        _ => {
+            let partial = skills.snapshot();
+            send_skill_report(out, node_id, &partial).await;
+            let out = out.clone();
+            let node_id = node_id.to_string();
+            tokio::spawn(async move {
+                if let Some(snap) = rx.recv().await {
+                    send_skill_report(&out, &node_id, &snap).await;
+                }
+            });
+        }
+    }
+}
+
+async fn send_skill_report(
+    out: &SessionOut,
+    node_id: &str,
+    snap: &novbot_node::skills::SkillSnapshot,
+) {
+    let _ = try_send(
+        out,
+        ClientMessage {
+            request_id: Uuid::new_v4().to_string(),
+            body: Some(client_message::Body::SkillState(snap.to_report(node_id))),
+        },
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn on_server(
     node_id: &str,
     state: &Arc<RwLock<RuntimeState>>,
     spool: &Arc<RetrySpool>,
     data_dir: &PathBuf,
     out: &SessionOut,
+    skills: &SkillHost,
     policy: ProbePolicy,
     msg: ServerMessage,
 ) -> Result<()> {
@@ -409,13 +549,16 @@ async fn on_server(
         server_message::Body::Heartbeat(resp) => {
             let local = state.read().await.config_generation;
             if resp.center_config_generation > local {
+                send_pull_config(node_id, state, out).await;
+            }
+            if skills.should_pull(resp.center_skill_set_generation) {
                 let _ = try_send(
                     out,
                     ClientMessage {
                         request_id: Uuid::new_v4().to_string(),
-                        body: Some(client_message::Body::PullConfig(PullConfigRequest {
+                        body: Some(client_message::Body::PullSkills(PullSkillsRequest {
                             node_id: node_id.to_string(),
-                            known_generation: local,
+                            known_generation: skills.applied_generation(),
                         })),
                     },
                 )
@@ -431,7 +574,7 @@ async fn on_server(
                 policy,
             )
             .await?;
-            send_node_ready(node_id, state, out).await;
+            send_node_ready(node_id, state, skills, out).await;
         }
         server_message::Body::PushConfig(push) => {
             let schedules_json = {
@@ -446,7 +589,7 @@ async fn on_server(
                 policy,
             )
             .await?;
-            send_node_ready(node_id, state, out).await;
+            send_node_ready(node_id, state, skills, out).await;
         }
         server_message::Body::PushSchedule(push) => {
             let mut st = state.write().await;
@@ -457,7 +600,8 @@ async fn on_server(
         server_message::Body::Dispatch(d) => {
             run_dispatch(node_id, state, spool, data_dir, out, &d, policy).await?;
         }
-        server_message::Body::ReportResult(_)
+        server_message::Body::DesiredSkills(_)
+        | server_message::Body::ReportResult(_)
         | server_message::Body::Ack(_)
         | server_message::Body::Error(_) => {}
     }
@@ -501,8 +645,14 @@ async fn apply_config(
     Ok(())
 }
 
-async fn send_node_ready(node_id: &str, state: &Arc<RwLock<RuntimeState>>, out: &SessionOut) {
+async fn send_node_ready(
+    node_id: &str,
+    state: &Arc<RwLock<RuntimeState>>,
+    skills: &SkillHost,
+    out: &SessionOut,
+) {
     let generation = state.read().await.config_generation;
+    let skill_set_generation = skills.applied_generation();
     let sent = try_send(
         out,
         ClientMessage {
@@ -510,6 +660,7 @@ async fn send_node_ready(node_id: &str, state: &Arc<RwLock<RuntimeState>>, out: 
             body: Some(client_message::Body::NodeReady(NodeReady {
                 node_id: node_id.to_string(),
                 config_generation: generation,
+                skill_set_generation,
             })),
         },
     )
@@ -896,6 +1047,16 @@ mod exec_gate_tests {
 #[cfg(test)]
 mod dispatch_ready_tests {
     use super::{apply_config, on_server, run_dispatch, RuntimeState, SessionOut};
+    use novbot_node::skills::{ArtifactSource, Fetched, InstallLimits, SkillHost};
+
+    struct IdleSource;
+
+    #[async_trait::async_trait]
+    impl ArtifactSource for IdleSource {
+        async fn fetch(&self, _: &str, _: &str, _: u64) -> Result<Fetched, String> {
+            Err("no artifact".into())
+        }
+    }
     use novbot_core::{ProbePolicy, RetrySpool};
     use novbot_proto::{
         client_message, server_message, Dispatch, PullConfigResponse, ServerMessage,
@@ -1031,12 +1192,20 @@ mod dispatch_ready_tests {
                 schedules_json: "[]".into(),
             })),
         };
+        let skills = SkillHost::open(
+            &h.data_dir,
+            std::sync::Arc::new(IdleSource),
+            InstallLimits::default(),
+        )
+        .await
+        .unwrap();
         on_server(
             "node-1",
             &h.state,
             &h.spool,
             &h.data_dir,
             &h.out,
+            &skills,
             ProbePolicy::default(),
             msg,
         )

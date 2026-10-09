@@ -5,6 +5,8 @@ package novbot.v1;
 // Bi-directional control channel between node and center.
 service Control {
   rpc Session(stream ClientMessage) returns (stream ServerMessage);
+  // Package bytes. A fetch_ticket from DesiredSkills authorizes one sha256.
+  rpc FetchArtifact(FetchArtifactRequest) returns (stream ArtifactChunk);
 }
 
 message ClientMessage {
@@ -16,6 +18,8 @@ message ClientMessage {
     ReportResultRequest report_result = 13;
     Ack ack = 14;
     NodeReady node_ready = 15;
+    PullSkillsRequest pull_skills = 16;
+    SkillStateReport skill_state = 17;
   }
 }
 
@@ -29,6 +33,7 @@ message ServerMessage {
     PushConfig push_config = 20;
     Dispatch dispatch = 21;
     PushSchedule push_schedule = 22;
+    DesiredSkills desired_skills = 23;
     Ack ack = 30;
     ErrorResponse error = 31;
   }
@@ -40,6 +45,12 @@ message RegisterRequest {
   string version = 3;
   string bootstrap_token = 4;
   map<string, string> labels = 5;
+  // Empty means this node build has no Skills Hub support.
+  string skill_abi = 6;
+  repeated string capabilities_supported = 7;
+  int64 skill_set_generation = 8;
+  repeated InstalledSkill installed = 9;
+  bool supports_ready = 10;
 }
 
 message RegisterResponse {
@@ -51,17 +62,80 @@ message RegisterResponse {
 message HeartbeatRequest {
   string node_id = 1;
   int64 config_generation = 2;
+  int64 skill_set_generation = 3;
 }
 
 message HeartbeatResponse {
   bool ok = 1;
   int64 center_config_generation = 2;
+  int64 center_skill_set_generation = 3;
 }
 
 message NodeReady {
   string node_id = 1;
   // Config generation the node has applied in memory.
   int64 config_generation = 2;
+  int64 skill_set_generation = 3;
+}
+
+message PullSkillsRequest {
+  string node_id = 1;
+  int64 known_generation = 2;
+}
+
+message DesiredSkills {
+  int64 generation = 1;
+  repeated SkillRef skills = 2;
+  SkillPolicy policy = 3;
+}
+
+message SkillRef {
+  string name = 1;
+  string version = 2;
+  string sha256 = 3;
+  int64 size_bytes = 4;
+  string abi = 5;
+  string capabilities_sha256 = 6;
+  bytes signature_envelope = 7;
+  string fetch_ticket = 8;
+}
+
+message SkillPolicy {
+  int32 max_concurrent_runs = 1;
+  int32 keep_previous_versions = 2;
+  int64 store_quota_bytes = 3;
+  int32 max_timeout_ms = 4;
+  int32 max_memory_mb = 5;
+}
+
+message FetchArtifactRequest {
+  string node_id = 1;
+  string sha256 = 2;
+  string fetch_ticket = 3;
+  int64 offset = 4;
+}
+
+message ArtifactChunk {
+  int64 offset = 1;
+  bytes data = 2;
+  int64 total_size = 3;
+}
+
+message InstalledSkill {
+  string name = 1;
+  string version = 2;
+  string sha256 = 3;
+  string state = 4;
+  string reason = 5;
+  string reason_detail = 6;
+  int32 attempts = 7;
+  repeated string previous_sha256 = 8;
+}
+
+message SkillStateReport {
+  string node_id = 1;
+  int64 applied_generation = 2;
+  repeated InstalledSkill skills = 3;
 }
 
 message PullConfigRequest {
