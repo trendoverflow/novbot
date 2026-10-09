@@ -98,6 +98,9 @@ fn examples_are_distinct_and_cap_violations_match() {
         "sshd-baseline",
         "listening-ports",
         "cap-violation-test",
+        "cpu-usage",
+        "process-top",
+        "net-interface-traffic",
     ];
     let mut clean = Clean::default();
     for name in projects {
@@ -117,6 +120,7 @@ fn examples_are_distinct_and_cap_violations_match() {
         assert_component_loads(&examples.join("sshd-baseline"), &[]);
         assert_component_loads(&examples.join("os-release-check"), &[]);
         assert_component_loads(&examples.join("os-release-check-1.1.0"), &[]);
+        assert_observability_examples(&examples);
         publish_packed_does_not_print_token(&examples.join("listening-ports"));
         scaffold_builds();
     }));
@@ -200,6 +204,56 @@ fn assert_cap_violation(project: &Path) {
         "net.listening_ports.read"
     );
     assert_eq!(undeclared["denials"][0]["reason"], "undeclared_capability");
+}
+
+fn assert_observability_examples(examples: &Path) {
+    let cases = [
+        ("cpu-usage", "cpu-usage-1.0.0.nbskill", "sys.metrics.read"),
+        ("process-top", "process-top-1.0.0.nbskill", "proc.list.read"),
+        (
+            "net-interface-traffic",
+            "net-interface-traffic-1.0.0.nbskill",
+            "net.interfaces.read",
+        ),
+    ];
+    for (dir, file, grant) in cases {
+        let project = examples.join(dir);
+        let package = load_packed(&project, file);
+        assert_eq!(package.manifest.name, dir);
+        assert_eq!(package.manifest.version, "1.0.0");
+        assert_eq!(package.manifest.grants, vec![grant.to_string()]);
+        let output = skill(&project, &["test"]);
+        let value: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("run json");
+        let code = value["error"]["code"].as_str().unwrap_or("");
+        assert_ne!(code, "capability_unsupported", "{value}");
+        assert_ne!(code, "invalid_component", "{value}");
+        assert!(value["denials"].as_array().unwrap().is_empty(), "{value}");
+        if value["status"] == "ok" {
+            let payload: serde_json::Value =
+                serde_json::from_str(value["output"].as_str().unwrap_or("")).expect("guest json");
+            if dir == "process-top" {
+                let text = payload.to_string();
+                assert!(!text.contains("cmdline"), "{text}");
+                assert!(!text.contains("command_line"), "{text}");
+                assert!(payload["by_cpu"].is_array(), "{payload}");
+            }
+            if dir == "cpu-usage" {
+                assert!(payload.get("cpu_usage_percent").is_some(), "{payload}");
+            }
+            if dir == "net-interface-traffic" {
+                assert!(payload["interfaces"].is_array(), "{payload}");
+            }
+        } else {
+            assert_eq!(value["error"]["code"], "guest_error", "{value}");
+            let message = value["error"]["message"].as_str().unwrap_or("");
+            assert!(message.starts_with("io:"), "{value}");
+        }
+        let inspected = skill(&project, &["inspect", file]);
+        let text = String::from_utf8_lossy(&inspected.stdout);
+        assert!(!text.contains("lint:"), "{text}");
+        assert!(text.contains(grant), "{text}");
+    }
 }
 
 fn assert_component_loads(project: &Path, extra: &[&str]) {

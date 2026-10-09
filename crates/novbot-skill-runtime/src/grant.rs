@@ -39,7 +39,8 @@ pub struct CapabilityDef {
     pub scope: ScopeRequirement,
 }
 
-/// SH-3 host functions. SH-9 names are intentionally absent.
+/// Host functions this runtime implements.
+/// `proc.cmdline.read` is phase 2 and is not listed.
 pub static CAPABILITIES: &[CapabilityDef] = &[
     CapabilityDef {
         name: "fs.read",
@@ -69,13 +70,25 @@ pub static CAPABILITIES: &[CapabilityDef] = &[
         name: "env.read",
         scope: ScopeRequirement::EnvKey,
     },
+    CapabilityDef {
+        name: "sys.metrics.read",
+        scope: ScopeRequirement::None,
+    },
+    CapabilityDef {
+        name: "proc.list.read",
+        scope: ScopeRequirement::None,
+    },
+    CapabilityDef {
+        name: "net.interfaces.read",
+        scope: ScopeRequirement::None,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantError {
     /// The string is not a grant, or the scope does not match the capability.
     Malformed(String),
-    /// The name is not in the SH-3 table (including later-phase capabilities).
+    /// The name is not in [`CAPABILITIES`] (including later-phase capabilities).
     Unsupported(String),
 }
 
@@ -311,7 +324,7 @@ mod tests {
     #[test]
     fn unknown_and_malformed_grants_fail() {
         assert!(matches!(
-            GrantSet::parse(&["sys.metrics.read"]),
+            GrantSet::parse(&["svc.status.read"]),
             Err(GrantError::Unsupported(_))
         ));
         assert!(matches!(
@@ -331,7 +344,29 @@ mod tests {
             Err(GrantError::Malformed(_))
         ));
         assert!(matches!(
-            GrantSet::parse(&["fs.read:/etc/passwd", "net.interfaces.read"]),
+            GrantSet::parse(&["fs.read:/etc/passwd", "net.connections.read"]),
+            Err(GrantError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn observability_grants_are_bare() {
+        for name in ["sys.metrics.read", "proc.list.read", "net.interfaces.read"] {
+            let grants = GrantSet::parse(&[name]).unwrap_or_else(|_| panic!("parse {name}"));
+            assert!(check(&grants, name, CheckTarget::None, &Denylist::new(None),).is_ok());
+            let scoped = format!("{name}:/etc");
+            assert!(matches!(
+                GrantSet::parse(&[&scoped]),
+                Err(GrantError::Malformed(_))
+            ));
+            let empty = GrantSet::parse(&[]).expect("empty");
+            assert_eq!(
+                check(&empty, name, CheckTarget::None, &Denylist::new(None)),
+                Err(DenialReason::UndeclaredCapability)
+            );
+        }
+        assert!(matches!(
+            GrantSet::parse(&["proc.cmdline.read"]),
             Err(GrantError::Unsupported(_))
         ));
     }

@@ -4,9 +4,11 @@
 //! Guest SDK for a `novbot:skill@1.0.0` component.
 //!
 //! Host imports are `fs.read`, `fs.stat`, `fs.list`, `net.listening-ports`,
-//! `sys.info`, `sys.time-sync`, `sys.env-get`, and `log`. Skills declare only
-//! `fs.read`, `fs.stat`, `fs.list`, `net.listening_ports.read`, `sys.info.read`,
-//! `sys.time_sync.read`, and `env.read`. Bindings come from the runtime WIT.
+//! `net.interfaces`, `sys.info`, `sys.time-sync`, `sys.env-get`, `sys.metrics`,
+//! `proc.processes`, and `log`. Skills declare `fs.read`, `fs.stat`, `fs.list`,
+//! `net.listening_ports.read`, `net.interfaces.read`, `sys.info.read`,
+//! `sys.time_sync.read`, `sys.metrics.read`, `proc.list.read`, and `env.read`.
+//! Bindings come from the runtime WIT.
 
 mod error;
 mod host;
@@ -20,7 +22,7 @@ pub mod guest_bind;
 pub mod testing;
 
 pub use error::HostError;
-pub use host::{env, fs, log, net, sys};
+pub use host::{env, fs, log, net, proc, sys};
 pub use types::{findings_json, FileStat, Finding, FindingStatus, ListenSocket};
 
 #[cfg(target_arch = "wasm32")]
@@ -113,6 +115,12 @@ mod tests {
             let info = sys::info().unwrap();
             assert!(info.contains("mock-host"));
             assert!(env::get("PATH").unwrap().is_none());
+            let metrics = sys::metrics().unwrap();
+            assert!(metrics.contains("usage_percent"));
+            let processes = proc::processes().unwrap();
+            assert!(processes.contains("processes"));
+            let interfaces = net::interfaces().unwrap();
+            assert!(interfaces.contains("interfaces"));
         });
         assert!(host
             .calls

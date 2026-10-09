@@ -11,6 +11,7 @@ pub mod path;
 
 mod deny;
 mod host;
+mod observe;
 mod wasi_deny;
 
 pub use grant::{CapabilityDef, DenialReason, ScopeRequirement, CAPABILITIES};

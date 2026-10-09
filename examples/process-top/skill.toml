@@ -1,0 +1,19 @@
+schema_version = 1
+name = "process-top"
+version = "1.0.0"
+display_name = "Process top"
+description = "Return the busiest processes without command lines"
+
+[runtime]
+kind = "wasm"
+abi = "novbot:skill@1"
+
+[runtime.limits]
+timeout_ms = 10000
+memory_mb = 32
+
+[files]
+
+[[capabilities]]
+name = "proc.list.read"
+reason = "List processes by CPU and memory"

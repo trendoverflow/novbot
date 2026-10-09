@@ -1,10 +1,11 @@
 // Copyright 2026 TrendOverflow / NovHub
 // SPDX-License-Identifier: Apache-2.0
 
-//! Component execution and the SH-3 host functions.
+//! Component execution and the read-only host functions.
 
 use crate::deny::Denylist;
 use crate::grant::{self, CheckTarget, DenialReason, GrantSet};
+use crate::observe;
 use crate::path::{self, display_path, Resolved};
 use crate::wasi_deny;
 use crate::{Denial, RunOutput, DENIAL_LIMIT, MAX_READ_BYTES};
@@ -536,6 +537,19 @@ impl crate::novbot::skill::net::Host for RunCtx {
             Err(err) => Ok(Err(crate::novbot::skill::types::HostError::Io(err))),
         }
     }
+
+    fn interfaces(&mut self) -> Result<Result<String, crate::novbot::skill::types::HostError>> {
+        if !authorize_bare(self, "net.interfaces.read")? {
+            let denial = self.denials.last().expect("denial recorded");
+            return Ok(Err(crate::novbot::skill::types::HostError::Denied(
+                wit_denial(&denial.capability, &denial.target, denial.reason),
+            )));
+        }
+        match observe::interfaces_json() {
+            Ok(text) => Ok(Ok(text)),
+            Err(err) => Ok(Err(crate::novbot::skill::types::HostError::Io(err))),
+        }
+    }
 }
 
 impl crate::novbot::skill::sys::Host for RunCtx {
@@ -559,6 +573,19 @@ impl crate::novbot::skill::sys::Host for RunCtx {
         Ok(Ok(time_sync_json()))
     }
 
+    fn metrics(&mut self) -> Result<Result<String, crate::novbot::skill::types::HostError>> {
+        if !authorize_bare(self, "sys.metrics.read")? {
+            let denial = self.denials.last().expect("denial recorded");
+            return Ok(Err(crate::novbot::skill::types::HostError::Denied(
+                wit_denial(&denial.capability, &denial.target, denial.reason),
+            )));
+        }
+        match observe::metrics_json() {
+            Ok(text) => Ok(Ok(text)),
+            Err(err) => Ok(Err(crate::novbot::skill::types::HostError::Io(err))),
+        }
+    }
+
     fn env_get(
         &mut self,
         key: String,
@@ -577,6 +604,21 @@ impl crate::novbot::skill::sys::Host for RunCtx {
                     wit_denial("env.read", &key, reason),
                 )))
             }
+        }
+    }
+}
+
+impl crate::novbot::skill::proc::Host for RunCtx {
+    fn processes(&mut self) -> Result<Result<String, crate::novbot::skill::types::HostError>> {
+        if !authorize_bare(self, "proc.list.read")? {
+            let denial = self.denials.last().expect("denial recorded");
+            return Ok(Err(crate::novbot::skill::types::HostError::Denied(
+                wit_denial(&denial.capability, &denial.target, denial.reason),
+            )));
+        }
+        match observe::processes_json() {
+            Ok(text) => Ok(Ok(text)),
+            Err(err) => Ok(Err(crate::novbot::skill::types::HostError::Io(err))),
         }
     }
 }
