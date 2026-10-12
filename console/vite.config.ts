@@ -5,7 +5,9 @@ import react from '@vitejs/plugin-react'
 import { defineConfig, type ServerOptions } from 'vite'
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url))
-const centerTarget = process.env.NOVBOT_CENTER_URL ?? 'http://127.0.0.1:8080'
+// OrbStack Mac demo tunnels center to :18080 (OrbStack often owns :8080).
+// Override with NOVBOT_CENTER_URL for docker-compose / direct :8080.
+const centerTarget = process.env.NOVBOT_CENTER_URL ?? 'http://127.0.0.1:18080'
 const certDir = path.resolve(rootDir, '.certs')
 const keyPath = path.join(certDir, 'localhost-key.pem')
 const certPath = path.join(certDir, 'localhost.pem')
