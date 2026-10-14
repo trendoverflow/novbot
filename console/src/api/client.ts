@@ -226,6 +226,7 @@ export type DispatchBody = {
   spec_id: string
   params?: unknown
   run_id?: string
+  confirm_prod?: ConfirmProd
 }
 
 export type DispatchResponse = {
@@ -272,7 +273,9 @@ export type SkillGroupsResponse = {
 
 export type PushSkillGroupBody = {
   group_id: string
-  node_ids: string[]
+  node_ids?: string[]
+  target?: SharedTarget
+  confirm_prod?: ConfirmProd
 }
 
 export type PushSkillGroupResultRow = {
@@ -291,6 +294,7 @@ export type PushSkillGroupResponse = {
   group_name?: string
   skills?: string[]
   results: PushSkillGroupResultRow[]
+  resolution?: TargetResolution
 }
 
 export type TokensStatus = {
@@ -388,20 +392,27 @@ export type SkillSelector = {
 
 export type InstallSkillBody = {
   version: string
-  node_ids: string[]
+  node_ids?: string[]
   selector?: SkillSelector
+  target?: SharedTarget
+  confirm_prod?: ConfirmProd
   accepted_capabilities_sha256: string
+  dry_run?: boolean
 }
 
 export type RollbackSkillBody = {
-  node_ids: string[]
+  node_ids?: string[]
   selector?: SkillSelector
+  target?: SharedTarget
+  confirm_prod?: ConfirmProd
   to_version?: string
 }
 
 export type UninstallSkillBody = {
-  node_ids: string[]
+  node_ids?: string[]
   selector?: SkillSelector
+  target?: SharedTarget
+  confirm_prod?: ConfirmProd
   force: boolean
 }
 
@@ -413,8 +424,114 @@ export type PerNodeOutcome = {
 
 export type SkillChangeResponse = {
   operation_id: string | null
+  resolution_id?: string | null
   dry_run: boolean
   per_node: PerNodeOutcome[]
+}
+
+/** Shared target. Exactly one of `selector` or `node_ids`. */
+export type SharedTarget = {
+  selector?: string
+  node_ids?: string[]
+  exclude_node_ids?: string[]
+  expected_node_ids?: string[]
+}
+
+export type ConfirmProd = {
+  node_count: number
+}
+
+export type TargetNodeHit = {
+  node_id: string
+  hostname: string
+  online: boolean
+  registered: boolean
+  prod: boolean
+  tags: Record<string, string>
+}
+
+export type TargetResolution = {
+  id?: string
+  selector: string | null
+  resolved_at: string
+  node_ids: string[]
+  excluded_node_ids: string[]
+  nodes: TargetNodeHit[]
+  count: number
+  offline_count: number
+  prod_node_ids: string[]
+  prod_node_count: number
+  resolution_sha256: string
+}
+
+export type TargetDispatchRun = {
+  node_id: string
+  run_id: string
+  delivered: string
+}
+
+export type TargetWarning = {
+  node_id: string
+  code: string
+}
+
+export type TargetDispatchResponse = {
+  operation_id: string
+  resolution: TargetResolution
+  per_node: TargetDispatchRun[]
+  warnings: TargetWarning[]
+}
+
+export type DispatchOperation = {
+  id: string
+  spec_id: string
+  params: unknown
+  resolution: TargetResolution
+  actor: string
+  created_at: string
+  per_node: TargetDispatchRun[]
+}
+
+export type ScheduleNodeState = {
+  node_id: string
+  state: string
+}
+
+export type NodeDiff = {
+  added: string[]
+  removed: string[]
+}
+
+export type TargetSchedule = {
+  id: string
+  spec_id: string
+  interval_secs: number | null
+  cron: string | null
+  enabled: boolean
+  resolution_id: string
+  selector: string | null
+  node_ids: string[]
+  resolved_at: string
+  nodes: ScheduleNodeState[]
+  drift: NodeDiff
+}
+
+export type ScheduleCreateResponse = {
+  id: string
+  resolution: TargetResolution
+  per_node: ScheduleNodeState[]
+  warnings: TargetWarning[]
+}
+
+export type ReResolveResponse = {
+  dry_run: boolean
+  added: string[]
+  removed: string[]
+  prod_node_ids: string[]
+  prod_node_count: number
+  per_node: ScheduleNodeState[]
+  resolution_id?: string
+  warnings: TargetWarning[]
 }
 
 export type NodeSkillItem = {
@@ -491,6 +608,83 @@ export const api = {
   dispatch: (nodeId: string, body: DispatchBody) =>
     request<DispatchResponse>(
       `/nodes/${encodeURIComponent(nodeId)}/dispatch`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body),
+      },
+    ),
+
+  resolveTarget: (body: { target: SharedTarget }) =>
+    request<TargetResolution>('/targets/resolve', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  dispatchTarget: (body: {
+    target: SharedTarget
+    spec_id: string
+    params?: unknown
+    confirm_prod?: ConfirmProd
+  }) =>
+    request<TargetDispatchResponse>('/dispatch', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  listDispatchOperations: () =>
+    request<{ items: DispatchOperation[] }>('/dispatch-operations'),
+
+  getDispatchOperation: (id: string) =>
+    request<DispatchOperation>(
+      `/dispatch-operations/${encodeURIComponent(id)}`,
+    ),
+
+  listTargetSchedules: () =>
+    request<{ items: TargetSchedule[] }>('/schedules'),
+
+  createTargetSchedule: (body: {
+    target: SharedTarget
+    spec_id: string
+    interval_secs?: number
+    cron?: string
+    enabled?: boolean
+    confirm_prod?: ConfirmProd
+  }) =>
+    request<ScheduleCreateResponse>('/schedules', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  patchTargetSchedule: (
+    id: string,
+    body: {
+      interval_secs?: number
+      cron?: string
+      enabled?: boolean
+      clear_interval?: boolean
+      clear_cron?: boolean
+    },
+  ) =>
+    request<TargetSchedule>(`/schedules/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  deleteTargetSchedule: (id: string) =>
+    request<unknown>(`/schedules/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  reResolveSchedule: (
+    id: string,
+    body: {
+      dry_run: boolean
+      expected_diff?: NodeDiff
+      confirm_prod?: ConfirmProd
+    },
+  ) =>
+    request<ReResolveResponse>(
+      `/schedules/${encodeURIComponent(id)}/re-resolve`,
       {
         method: 'POST',
         body: JSON.stringify(body),
@@ -595,6 +789,21 @@ export function isCapabilitiesChanged(error: unknown): boolean {
     error.status === 409 &&
     apiErrorCode(error) === 'capabilities_changed'
   )
+}
+
+export function targetChangedDetail(
+  error: unknown,
+): { added: string[]; removed: string[] } | null {
+  if (!(error instanceof ApiError) || error.status !== 409) return null
+  if (apiErrorCode(error) !== 'target_changed') return null
+  const body = error.body
+  const list = (value: unknown) =>
+    Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string')
+      : []
+  if (!body || typeof body !== 'object') return { added: [], removed: [] }
+  const record = body as { added?: unknown; removed?: unknown }
+  return { added: list(record.added), removed: list(record.removed) }
 }
 
 function stringList(value: unknown): string[] {

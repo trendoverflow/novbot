@@ -9,6 +9,7 @@ import {
   type NodeConfig,
 } from '../api/client'
 import { JsonTextArea } from '../components/JsonTextArea'
+import { ProdTypeConfirm } from '../components/TargetPicker'
 import { ResultsTable } from '../components/ResultsTable'
 import {
   Button,
@@ -444,6 +445,25 @@ export function NodeDispatchTab() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<Error | null>(null)
   const [result, setResult] = useState<DispatchResponse | null>(null)
+  const [prodCount, setProdCount] = useState<number | null>(null)
+  const [typedProd, setTypedProd] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    setProdCount(null)
+    setTypedProd('')
+    api
+      .resolveTarget({ target: { node_ids: [nodeId] } })
+      .then((view) => {
+        if (!cancelled) setProdCount(view.prod_node_count)
+      })
+      .catch(() => {
+        if (!cancelled) setProdCount(0)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [nodeId])
 
   const specOptions = useMemo(() => {
     if (configState.status !== 'ready') return [] as string[]
@@ -473,6 +493,9 @@ export function NodeDispatchTab() {
         spec_id: specId.trim(),
         params,
         ...(runId.trim() ? { run_id: runId.trim() } : {}),
+        ...(prodCount && prodCount > 0
+          ? { confirm_prod: { node_count: prodCount } }
+          : {}),
       }
       const res = await api.dispatch(nodeId, body)
       setResult(res)
@@ -545,8 +568,22 @@ export function NodeDispatchTab() {
           rows={8}
           disabled={busy}
         />
+        <ProdTypeConfirm
+          prodCount={prodCount ?? 0}
+          value={typedProd}
+          onChange={setTypedProd}
+          disabled={busy}
+        />
         <Toolbar>
-          <Button type="submit" disabled={busy || !specId.trim()}>
+          <Button
+            type="submit"
+            disabled={
+              busy ||
+              !specId.trim() ||
+              prodCount == null ||
+              (prodCount > 0 && typedProd !== 'prod')
+            }
+          >
             {busy ? 'Dispatching…' : 'Dispatch'}
           </Button>
         </Toolbar>
