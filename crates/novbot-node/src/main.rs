@@ -64,9 +64,14 @@ struct Args {
     #[arg(long, env = "NOVBOT_DATA_DIR", default_value = "./data")]
     data_dir: PathBuf,
 
-    /// Node labels sent on Register, as comma-separated key=value pairs (e.g. "role=db,env=demo").
-    #[arg(long, env = "NOVBOT_NODE_LABELS", default_value = "")]
-    labels: String,
+    /// Node-declared tags sent on Register, comma-separated key=value (e.g. "role=db,env=demo").
+    /// `--labels` / NOVBOT_NODE_LABELS is the same list. Setting both names is an error.
+    #[arg(long, env = "NOVBOT_NODE_TAGS")]
+    tags: Option<String>,
+
+    /// Alias of `--tags`. Do not set both.
+    #[arg(long, env = "NOVBOT_NODE_LABELS")]
+    labels: Option<String>,
 
     #[arg(long, default_value = "15")]
     heartbeat_secs: u64,
@@ -99,6 +104,13 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let node_tags = match resolve_declared_tags(args.tags.as_deref(), args.labels.as_deref()) {
+        Ok(raw) => raw,
+        Err(err) => {
+            eprintln!("novbot-node: {err}");
+            std::process::exit(2);
+        }
+    };
     let cfg = match load_node_config(&args) {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -123,8 +135,10 @@ async fn main() -> Result<()> {
         bootstrap_token,
         bootstrap_token_source = %bootstrap_token_source,
         config_file = %config_file,
+        node_tags = %node_tags,
         "starting novbot-node"
     );
+    warn_invalid_tags(&node_tags);
     if cfg.allow_exec.value {
         tracing::warn!(
             allow_exec = true,
@@ -234,6 +248,7 @@ async fn main() -> Result<()> {
     loop {
         match run_session(
             &args,
+            &node_tags,
             &cfg,
             &hostname,
             &state,
@@ -309,6 +324,7 @@ fn warn_plaintext_skills(addr: &config::CenterAddr) {
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     args: &Args,
+    node_tags: &str,
     cfg: &config::NodeConfig,
     hostname: &str,
     state: &Arc<RwLock<RuntimeState>>,
@@ -344,7 +360,9 @@ async fn run_session(
                 .as_ref()
                 .map(|token| token.value.expose().to_string())
                 .unwrap_or_default(),
-            labels: parse_labels(&args.labels),
+            tags: parse_labels(node_tags),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
             skill_abi: ABI.into(),
             capabilities_supported: CATALOG.iter().map(|cap| (*cap).to_string()).collect(),
             skill_set_generation: skills.applied_generation(),
@@ -420,7 +438,31 @@ async fn run_session(
     Ok(())
 }
 
-/// Parse "k=v,k2=v2" into a label map. Blank entries and entries without '=' or with an empty key are ignored.
+/// One of `--tags` / `NOVBOT_NODE_TAGS` or `--labels` / `NOVBOT_NODE_LABELS`, not both.
+fn resolve_declared_tags(tags: Option<&str>, labels: Option<&str>) -> Result<String, &'static str> {
+    match (tags, labels) {
+        (Some(_), Some(_)) => {
+            Err("set only one of --tags / NOVBOT_NODE_TAGS or --labels / NOVBOT_NODE_LABELS")
+        }
+        (Some(raw), None) | (None, Some(raw)) => Ok(raw.to_string()),
+        (None, None) => Ok(String::new()),
+    }
+}
+
+fn warn_invalid_tags(raw: &str) {
+    for tag in novbot_core::tags::classify_declared_tags(&parse_labels(raw)) {
+        if let Some(reason) = tag.invalid_reason {
+            tracing::warn!(
+                key = %tag.key,
+                value = %tag.value,
+                reason,
+                "node-declared tag is invalid and will not be used for selection"
+            );
+        }
+    }
+}
+
+/// Parse "k=v,k2=v2" into a tag map. Blank entries and entries without '=' or with an empty key are ignored.
 fn parse_labels(raw: &str) -> HashMap<String, String> {
     raw.split(',')
         .filter_map(|pair| {
@@ -901,7 +943,7 @@ async fn flush_spool(spool: &RetrySpool, out: &SessionOut) -> Result<()> {
 
 #[cfg(test)]
 mod label_tests {
-    use super::{parse_labels, Args};
+    use super::{parse_labels, resolve_declared_tags, Args};
     use clap::Parser;
 
     #[test]
@@ -915,6 +957,21 @@ mod label_tests {
     #[test]
     fn empty_is_empty() {
         assert!(parse_labels("").is_empty());
+    }
+
+    #[test]
+    fn tags_and_labels_cannot_both_be_set() {
+        let err = resolve_declared_tags(Some("role=db"), Some("role=web")).unwrap_err();
+        assert!(err.contains("--tags"), "{err}");
+        assert_eq!(
+            resolve_declared_tags(Some("role=db"), None).unwrap(),
+            "role=db"
+        );
+        assert_eq!(
+            resolve_declared_tags(None, Some("env=demo")).unwrap(),
+            "env=demo"
+        );
+        assert_eq!(resolve_declared_tags(None, None).unwrap(), "");
     }
 
     #[test]

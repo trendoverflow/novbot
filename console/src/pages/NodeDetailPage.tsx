@@ -37,6 +37,9 @@ export function NodeDetailPage() {
         <NavLink to="inventory" className={tabClass}>
           Inventory
         </NavLink>
+        <NavLink to="tags" className={tabClass}>
+          Tags
+        </NavLink>
         <NavLink to="skills" className={tabClass}>
           Skills
         </NavLink>
@@ -107,8 +110,12 @@ export function NodeInventoryTab() {
         <dd className="mono">{row?.version || '—'}</dd>
         <dt>Last seen</dt>
         <dd>{formatTime(row?.last_seen_at ?? null)}</dd>
-        <dt>Labels</dt>
+        <dt>Boot labels</dt>
         <dd>
+          <p className="muted small">
+            Deprecated. Pairs sent at register. Effective tags are on the{' '}
+            <Link to={`/nodes/${encodeURIComponent(nodeId)}/tags`}>Tags</Link> tab.
+          </p>
           <pre className="json-pre inline">
             {JSON.stringify(row?.labels ?? {}, null, 2)}
           </pre>

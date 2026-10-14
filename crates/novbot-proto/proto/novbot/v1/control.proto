@@ -44,13 +44,18 @@ message RegisterRequest {
   string hostname = 2;
   string version = 3;
   string bootstrap_token = 4;
-  map<string, string> labels = 5;
+  // Node-declared tags. Formerly `labels`. Identified by field number 5.
+  map<string, string> tags = 5;
   // Empty means this node build has no Skills Hub support.
   string skill_abi = 6;
   repeated string capabilities_supported = 7;
   int64 skill_set_generation = 8;
   repeated InstalledSkill installed = 9;
   bool supports_ready = 10;
+  // std::env::consts::OS. Empty when the node build does not send it.
+  string os = 11;
+  // std::env::consts::ARCH. Empty when the node build does not send it.
+  string arch = 12;
 }
 
 message RegisterResponse {

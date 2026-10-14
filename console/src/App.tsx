@@ -11,6 +11,8 @@ import {
   NodeSchedulesTab,
   NodeSkillsTab,
 } from './pages/NodeDetailPage'
+import { NodeTagsTab } from './pages/NodeTagsTab'
+import { TagsPage } from './pages/TagsPage'
 import { ResultsPage } from './pages/ResultsPage'
 import { FleetSkillGroupsPage } from './pages/FleetSkillGroupsPage'
 import { SkillDetailPage } from './pages/SkillDetailPage'
@@ -27,9 +29,11 @@ export default function App() {
       <Route element={<AppLayout />}>
         <Route index element={<OverviewPage />} />
         <Route path="nodes" element={<NodesListPage />} />
+        <Route path="tags" element={<TagsPage />} />
         <Route path="nodes/:nodeId" element={<NodeDetailPage />}>
           <Route index element={<Navigate to="inventory" replace />} />
           <Route path="inventory" element={<NodeInventoryTab />} />
+          <Route path="tags" element={<NodeTagsTab />} />
           <Route path="skills" element={<NodeSkillsTab />} />
           <Route path="config" element={<NodeConfigTab />} />
           <Route path="schedules" element={<NodeSchedulesTab />} />

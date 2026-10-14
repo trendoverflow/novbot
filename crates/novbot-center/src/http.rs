@@ -7,13 +7,14 @@ use crate::skill_bundles;
 use crate::skill_catalog::{self, HubSkillItem, SkillDetail, VersionDetail};
 use crate::skill_delivery;
 use crate::skill_desired;
+use crate::tags;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use novbot_proto::{server_message, Dispatch, ServerMessage};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,11 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
         .route("/nodes", get(list_nodes))
+        .route("/nodes/{id}/tags", get(get_node_tags))
+        .route(
+            "/nodes/{id}/tags/{key}",
+            put(put_node_tag).delete(delete_node_tag),
+        )
         .route("/nodes/{id}/config", get(get_config).put(put_config))
         .route(
             "/nodes/{id}/schedules",
@@ -70,6 +76,8 @@ pub fn router(state: AppState) -> Router {
         .route("/skill-operations", get(list_skill_operations))
         .route("/skill-operations/{id}", get(get_skill_operation))
         .route("/skill-capabilities", get(list_skill_capabilities))
+        .route("/tags", get(list_tag_overview))
+        .route("/tags/bulk", post(bulk_tags))
         .route("/audit-events", get(list_audit_events))
         .route(
             "/skill-bundles",
@@ -96,6 +104,9 @@ pub fn router(state: AppState) -> Router {
         .route("/ee/skills/registries", any(license_stub))
         .route("/ee/skills/trusted-keys", any(license_stub))
         .route("/ee/audit/export", any(license_stub))
+        .route("/ee/tag-policies", any(license_stub))
+        .route("/ee/protected-selectors", any(license_stub))
+        .route("/ee/tag-scopes", any(license_stub))
         .route_layer(from_fn_with_state(state.clone(), require_api_token));
 
     Router::new()
@@ -559,8 +570,71 @@ async fn create_token() -> impl IntoResponse {
     )
 }
 
-async fn list_nodes(State(st): State<AppState>) -> Result<Json<Vec<NodeRow>>, ApiError> {
-    Ok(Json(st.db.list_nodes().await?))
+#[derive(Debug, Deserialize)]
+struct ListNodesQuery {
+    #[serde(default)]
+    selector: Option<String>,
+}
+
+async fn list_nodes(
+    State(st): State<AppState>,
+    Query(query): Query<ListNodesQuery>,
+) -> Result<Json<Vec<NodeRow>>, ApiError> {
+    let selector = tags::parse_list_selector(query.selector.as_deref())?;
+    let mut nodes = st.db.list_nodes().await?;
+    if let Some(selector) = selector {
+        nodes.retain(|node| novbot_core::tags::selector_matches(&selector, &node.tags));
+    }
+    Ok(Json(nodes))
+}
+
+async fn get_node_tags(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<tags::NodeTags>, ApiError> {
+    Ok(Json(tags::node_tags(&st.db, &id).await?))
+}
+
+async fn put_node_tag(
+    State(st): State<AppState>,
+    Path((id, key)): Path<(String, String)>,
+    Json(body): Json<tags::PutTagBody>,
+) -> Result<(StatusCode, Json<tags::TagMutation>), ApiError> {
+    let result = tags::set_center_tag(&st.db, &id, &key, body).await?;
+    let status = if result.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(result.tag)))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteTagQuery {
+    #[serde(default)]
+    confirm_prod_count: Option<u64>,
+}
+
+async fn delete_node_tag(
+    State(st): State<AppState>,
+    Path((id, key)): Path<(String, String)>,
+    Query(query): Query<DeleteTagQuery>,
+) -> Result<StatusCode, ApiError> {
+    tags::delete_center_tag(&st.db, &id, &key, query.confirm_prod_count).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_tag_overview(
+    State(st): State<AppState>,
+) -> Result<Json<tags::TagOverview>, ApiError> {
+    Ok(Json(tags::overview(&st.db).await?))
+}
+
+async fn bulk_tags(
+    State(st): State<AppState>,
+    Json(body): Json<tags::BulkBody>,
+) -> Result<Json<tags::BulkResponse>, ApiError> {
+    Ok(Json(tags::bulk(&st.db, body).await?))
 }
 
 async fn get_config(
@@ -957,6 +1031,69 @@ impl From<skill_catalog::CatalogError> for ApiError {
                 "version_in_use",
                 "skill version is still desired, reported, or pinned by a bundle",
             ),
+            Internal(err) => ApiError::from(err),
+        }
+    }
+}
+
+impl From<tags::TagError> for ApiError {
+    fn from(err: tags::TagError) -> Self {
+        use tags::TagError::*;
+        match err {
+            KeyInvalid => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "tag_key_invalid",
+                "tag key is invalid",
+            ),
+            ValueInvalid => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "tag_value_invalid",
+                "tag value is invalid",
+            ),
+            KeyReserved => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "tag_key_reserved",
+                "tag key is reserved",
+            ),
+            LimitExceeded => ApiError::coded(
+                StatusCode::CONFLICT,
+                "tag_limit_exceeded",
+                "center tag limit exceeded",
+            ),
+            NodeUnknown => ApiError::coded(StatusCode::NOT_FOUND, "node_unknown", "unknown node"),
+            TagNotFound => ApiError::coded(StatusCode::NOT_FOUND, "tag_not_found", "tag not found"),
+            TagNotCenter => ApiError::coded(
+                StatusCode::CONFLICT,
+                "tag_not_center",
+                "tag is not a center tag",
+            ),
+            TagConflict => ApiError::coded(
+                StatusCode::CONFLICT,
+                "tag_conflict",
+                "center tag value does not match if_value",
+            ),
+            Selector(err) => {
+                ApiError::coded(StatusCode::BAD_REQUEST, "selector_invalid", err.message)
+                    .with_extra(serde_json::json!({ "position": err.position }))
+            }
+            Prod {
+                prod_node_ids,
+                prod_node_count,
+            } => ApiError::coded(
+                StatusCode::PRECONDITION_REQUIRED,
+                "prod_confirmation_required",
+                "prod confirmation required",
+            )
+            .with_extra(serde_json::json!({
+                "prod_node_ids": prod_node_ids,
+                "prod_node_count": prod_node_count,
+            })),
+            TooManyTargets => ApiError::coded(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_many_targets",
+                "too many targets",
+            ),
+            BadRequest(message) => ApiError::bad_request(message),
             Internal(err) => ApiError::from(err),
         }
     }

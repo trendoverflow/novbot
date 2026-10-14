@@ -10,6 +10,7 @@ mod skill_bundles;
 mod skill_catalog;
 mod skill_delivery;
 mod skill_desired;
+mod tags;
 
 #[cfg(test)]
 mod d10_21;

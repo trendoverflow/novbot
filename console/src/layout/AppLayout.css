@@ -647,6 +647,75 @@ select.input {
   font-size: 0.8rem;
 }
 
+.tag-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.filter-chips {
+  margin: 0 0 0.85rem;
+}
+
+.tag-chip {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  border: 1px solid transparent;
+  line-height: 1.4;
+}
+
+button.tag-chip {
+  cursor: pointer;
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.75rem;
+}
+
+.tag-chip-center {
+  background: #dbeafe;
+  color: #1e3a8a;
+  border-color: #93c5fd;
+}
+
+.tag-chip-node {
+  background: #fff;
+  color: #334155;
+  border-color: #cbd5e1;
+}
+
+.tag-chip-system {
+  background: #f1f5f9;
+  color: #64748b;
+  border-color: #e2e8f0;
+}
+
+.tag-chip-prod {
+  background: #fee2e2;
+  color: #991b1b;
+  border-color: #fecaca;
+}
+
+.tag-warn {
+  color: #b45309;
+  font-weight: 700;
+}
+
+.tag-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: flex-end;
+  margin-bottom: 0.75rem;
+}
+
+.group-block + .group-block {
+  margin-top: 0.85rem;
+}
+
 @media (max-width: 720px) {
   .dialog-backdrop {
     padding: 0.5rem;
