@@ -102,8 +102,100 @@ export type NodeSummary = {
   node_id: string
   hostname: string
   version: string
+  /** Boot-reported pairs from Register. Deprecated. */
   labels: unknown
+  /** Effective tags: center, else valid node, else system. */
+  tags?: Record<string, string>
+  /** Source of each effective tag: center, node, or system. */
+  tag_sources?: Record<string, string>
+  /** Invalid node-declared pairs. They are not part of `tags`. */
+  invalid_tag_count?: number
   last_seen_at: string | null
+}
+
+export type TagRow = {
+  key: string
+  value: string
+  source: string
+  effective: boolean
+  overridden: boolean
+  node_value: string | null
+  valid: boolean
+  invalid_reason: string | null
+  updated_at: string
+  updated_by: string
+}
+
+export type NodeTagsResponse = {
+  node_id: string
+  tags: TagRow[]
+}
+
+export type TagMutation = {
+  node_id: string
+  key: string
+  value: string
+  source: string
+  overridden: boolean
+  node_value: string | null
+  effective_value: string
+}
+
+export type PutTagBody = {
+  value: string
+  if_value?: string
+  confirm_prod?: { node_count: number }
+}
+
+export type TagValueStat = {
+  value: string
+  nodes: number
+  sources: Record<string, number>
+}
+
+export type TagKeyStat = {
+  key: string
+  values: TagValueStat[]
+}
+
+export type TagOverview = {
+  keys: TagKeyStat[]
+  missing: Record<string, number>
+  rare_values: { key: string; value: string; nodes: number }[]
+  invalid: { node_id: string; key: string; value: string; invalid_reason: string }[]
+}
+
+export type BulkTagBody = {
+  node_ids: string[]
+  add?: Record<string, string>
+  remove?: string[]
+  dry_run: boolean
+  confirm_prod?: { node_count: number }
+}
+
+export type BulkTagItem = {
+  key: string
+  action: string
+  old_value: string | null
+  new_value: string | null
+  error: string | null
+}
+
+export type BulkTagResponse = {
+  operation_id: string | null
+  dry_run: boolean
+  prod_node_ids: string[]
+  prod_node_count: number
+  counts: {
+    added: number
+    changed: number
+    unchanged: number
+    removed: number
+    not_changed_boot_reported: number
+    not_found: number
+    error: number
+  }
+  per_node: { node_id: string; results: BulkTagItem[] }[]
 }
 
 /** GET/PUT /v1/nodes/:id/config — NodeConfig (JSON strings for specs/schedules) */
@@ -343,7 +435,38 @@ export type NodeSkillsResponse = {
 export const api = {
   health: () => requestHealth<HealthResponse>(),
 
-  listNodes: () => request<NodeSummary[]>('/nodes'),
+  listNodes: (selector?: string) => {
+    const params = new URLSearchParams()
+    if (selector) params.set('selector', selector)
+    const qs = params.toString()
+    return request<NodeSummary[]>(`/nodes${qs ? `?${qs}` : ''}`)
+  },
+
+  getNodeTags: (nodeId: string) =>
+    request<NodeTagsResponse>(`/nodes/${encodeURIComponent(nodeId)}/tags`),
+
+  putNodeTag: (nodeId: string, key: string, body: PutTagBody) =>
+    request<TagMutation>(
+      `/nodes/${encodeURIComponent(nodeId)}/tags/${encodeURIComponent(key)}`,
+      { method: 'PUT', body: JSON.stringify(body) },
+    ),
+
+  deleteNodeTag: (nodeId: string, key: string, confirmProdCount?: number) => {
+    const qs =
+      confirmProdCount != null ? `?confirm_prod_count=${confirmProdCount}` : ''
+    return request<unknown>(
+      `/nodes/${encodeURIComponent(nodeId)}/tags/${encodeURIComponent(key)}${qs}`,
+      { method: 'DELETE' },
+    )
+  },
+
+  tagOverview: () => request<TagOverview>('/tags'),
+
+  bulkTags: (body: BulkTagBody) =>
+    request<BulkTagResponse>('/tags/bulk', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 
   getConfig: (nodeId: string) =>
     request<NodeConfig>(`/nodes/${encodeURIComponent(nodeId)}/config`),

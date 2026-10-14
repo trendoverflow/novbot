@@ -41,6 +41,9 @@ export function AppLayout() {
           <NavLink to="/nodes" className={navClass}>
             Nodes
           </NavLink>
+          <NavLink to="/tags" className={navClass}>
+            Tags
+          </NavLink>
           <NavLink to="/results" className={navClass}>
             Results
           </NavLink>
