@@ -1,9 +1,11 @@
 import { useMemo, useState } from 'react'
 import {
   api,
+  targetChangedDetail,
   type PushSkillGroupResponse,
   type SkillGroup,
 } from '../api/client'
+import { TargetPicker, type PickerState } from '../components/TargetPicker'
 import {
   Button,
   EmptyState,
@@ -14,12 +16,21 @@ import {
 } from '../components/Ui'
 import { useAsync } from '../hooks/useAsync'
 
+const emptyPick: PickerState = {
+  ready: false,
+  target: null,
+  preview: null,
+}
+
 export function FleetSkillGroupsPage() {
   const groupsState = useAsync(() => api.listSkillGroups(), [])
-  const nodesState = useAsync(() => api.listNodes(), [])
 
   const [groupId, setGroupId] = useState('')
-  const [selected, setSelected] = useState<Record<string, boolean>>({})
+  const [pick, setPick] = useState<PickerState>(emptyPick)
+  const [refreshKey, setRefreshKey] = useState(0)
+  const [drift, setDrift] = useState<{ added: string[]; removed: string[] } | null>(
+    null,
+  )
   const [pushing, setPushing] = useState(false)
   const [pushError, setPushError] = useState<Error | null>(null)
   const [pushResult, setPushResult] = useState<PushSkillGroupResponse | null>(
@@ -36,38 +47,32 @@ export function FleetSkillGroupsPage() {
 
   const effectiveGroupId = activeGroup?.id ?? ''
 
-  function toggleNode(id: string) {
-    setSelected((prev) => ({ ...prev, [id]: !prev[id] }))
-  }
-
-  function selectAll(ids: string[]) {
-    const next: Record<string, boolean> = {}
-    for (const id of ids) next[id] = true
-    setSelected(next)
-  }
-
   async function onPush() {
     setPushError(null)
     setPushResult(null)
-    const nodeIds = Object.entries(selected)
-      .filter(([, on]) => on)
-      .map(([id]) => id)
     if (!effectiveGroupId) {
       setPushError(new Error('Select a skill group'))
       return
     }
-    if (nodeIds.length === 0) {
-      setPushError(new Error('Select at least one node'))
+    if (!pick.ready || !pick.target) {
+      setPushError(new Error('Wait for a stable target preview'))
       return
     }
     setPushing(true)
     try {
       const res = await api.pushSkillGroup({
         group_id: effectiveGroupId,
-        node_ids: nodeIds,
+        target: pick.target,
+        ...(pick.confirmProd ? { confirm_prod: pick.confirmProd } : {}),
       })
+      setDrift(null)
       setPushResult(res)
     } catch (e) {
+      const changed = targetChangedDetail(e)
+      if (changed) {
+        setDrift(changed)
+        setRefreshKey((n) => n + 1)
+      }
       setPushError(e instanceof Error ? e : new Error(String(e)))
     } finally {
       setPushing(false)
@@ -89,29 +94,18 @@ export function FleetSkillGroupsPage() {
       </p>
 
       <Toolbar>
-        <Button
-          variant="ghost"
-          onClick={() => {
-            groupsState.reload()
-            nodesState.reload()
-          }}
-        >
+        <Button variant="ghost" onClick={() => groupsState.reload()}>
           Refresh
         </Button>
       </Toolbar>
 
-      {groupsState.status === 'loading' || nodesState.status === 'loading' ? (
-        <Loading />
-      ) : null}
+      {groupsState.status === 'loading' ? <Loading /> : null}
       {groupsState.status === 'error' ? (
         <ErrorBanner error={groupsState.error} />
       ) : null}
-      {nodesState.status === 'error' ? (
-        <ErrorBanner error={nodesState.error} />
-      ) : null}
 
-      {groupsState.status === 'ready' && nodesState.status === 'ready' ? (
-        <div className="card form-stack" style={{ maxWidth: '48rem' }}>
+      {groupsState.status === 'ready' ? (
+        <div className="card form-stack" style={{ maxWidth: '52rem' }}>
           {groups.length === 0 ? (
             <EmptyState>No skill groups from center.</EmptyState>
           ) : (
@@ -137,53 +131,24 @@ export function FleetSkillGroupsPage() {
                 </p>
               ) : null}
 
-              <div className="field">
-                <span className="field-label">Nodes</span>
-                {nodesState.data.length === 0 ? (
-                  <EmptyState>
-                    No nodes registered. Configure a node first.
-                  </EmptyState>
-                ) : (
-                  <>
-                    <Toolbar>
-                      <Button
-                        variant="ghost"
-                        onClick={() =>
-                          selectAll(nodesState.data.map((n) => n.node_id))
-                        }
-                      >
-                        Select all
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        onClick={() => setSelected({})}
-                      >
-                        Clear
-                      </Button>
-                    </Toolbar>
-                    <ul className="check-list">
-                      {nodesState.data.map((n) => (
-                        <li key={n.node_id}>
-                          <label className="check-row">
-                            <input
-                              type="checkbox"
-                              checked={!!selected[n.node_id]}
-                              onChange={() => toggleNode(n.node_id)}
-                            />
-                            <span className="mono">{n.node_id}</span>
-                            <span className="muted">
-                              {n.hostname || '—'}
-                            </span>
-                          </label>
-                        </li>
-                      ))}
-                    </ul>
-                  </>
-                )}
-              </div>
+              <TargetPicker
+                onChange={setPick}
+                refreshKey={refreshKey}
+                disabled={pushing}
+              />
+              {drift ? (
+                <div className="alert alert-error" role="alert">
+                  <strong>409 target_changed</strong>
+                  <div>
+                    Added {drift.added.join(', ') || 'none'}. Removed{' '}
+                    {drift.removed.join(', ') || 'none'}. Preview again, then
+                    push.
+                  </div>
+                </div>
+              ) : null}
 
               <Toolbar>
-                <Button onClick={onPush} disabled={pushing}>
+                <Button onClick={onPush} disabled={pushing || !pick.ready}>
                   {pushing ? 'Pushing…' : 'Push skill group'}
                 </Button>
               </Toolbar>

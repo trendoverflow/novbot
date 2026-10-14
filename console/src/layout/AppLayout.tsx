@@ -44,6 +44,12 @@ export function AppLayout() {
           <NavLink to="/tags" className={navClass}>
             Tags
           </NavLink>
+          <NavLink to="/dispatch" className={navClass}>
+            Dispatch
+          </NavLink>
+          <NavLink to="/schedules" className={navClass}>
+            Schedules
+          </NavLink>
           <NavLink to="/results" className={navClass}>
             Results
           </NavLink>

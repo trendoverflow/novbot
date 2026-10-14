@@ -14,7 +14,9 @@ import {
 import { NodeTagsTab } from './pages/NodeTagsTab'
 import { TagsPage } from './pages/TagsPage'
 import { ResultsPage } from './pages/ResultsPage'
+import { DispatchPage } from './pages/DispatchPage'
 import { FleetSkillGroupsPage } from './pages/FleetSkillGroupsPage'
+import { SchedulesPage } from './pages/SchedulesPage'
 import { SkillDetailPage } from './pages/SkillDetailPage'
 import { SkillsListPage } from './pages/SkillsListPage'
 import {
@@ -40,6 +42,8 @@ export default function App() {
           <Route path="dispatch" element={<NodeDispatchTab />} />
           <Route path="results" element={<NodeResultsTab />} />
         </Route>
+        <Route path="dispatch" element={<DispatchPage />} />
+        <Route path="schedules" element={<SchedulesPage />} />
         <Route path="results" element={<ResultsPage />} />
         <Route path="skills" element={<SkillsListPage />} />
         <Route path="skills/:name" element={<SkillDetailPage />} />

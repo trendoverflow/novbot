@@ -11,6 +11,7 @@ mod skill_catalog;
 mod skill_delivery;
 mod skill_desired;
 mod tags;
+mod targets;
 
 #[cfg(test)]
 mod d10_21;

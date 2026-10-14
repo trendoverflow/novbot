@@ -1,12 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   ApiError,
   api,
   apiErrorCode,
-  formatTime,
   isCapabilitiesChanged,
   skillInUseRefs,
-  type NodeSummary,
+  targetChangedDetail,
   type SkillChangeResponse,
   type SkillVersionDetail,
   type SkillVersionSummary,
@@ -14,27 +13,24 @@ import {
 import {
   capabilityPromptLine,
   defaultInstallVersion,
-  filterNodes,
   generationChanged,
-  installTarget,
-  labelChipsFromNodes,
-  labelsMatch,
-  nodeLabelMap,
   outcomeDetail,
   outcomeHeadline,
   outcomePillClass,
   resultSummary,
-  selectorLabels,
   sortCapabilities,
-  toggleLabelChip,
-  type LabelChip,
-  type NodePick,
-  type NodePresence,
 } from '../skills/present'
 import { Button, ErrorBanner, Loading } from './Ui'
+import { TargetPicker, type PickerState } from './TargetPicker'
 
 type Action = 'install' | 'rollback' | 'uninstall'
 type Step = 'version' | 'nodes' | 'capabilities' | 'summary'
+
+const emptyPick: PickerState = {
+  ready: false,
+  target: null,
+  preview: null,
+}
 
 export function SkillChangeDialog({
   action,
@@ -58,16 +54,11 @@ export function SkillChangeDialog({
   const [version, setVersion] = useState(() =>
     action === 'rollback' ? '' : defaultInstallVersion(versions),
   )
-  const [nodes, setNodes] = useState<NodeSummary[]>([])
-  const [nodesError, setNodesError] = useState<Error | null>(null)
-  const [nodesLoading, setNodesLoading] = useState(true)
-  const [currentVersion, setCurrentVersion] = useState<
-    Record<string, { desired: string | null; actual: string | null }>
-  >({})
-  const [search, setSearch] = useState('')
-  const [presence, setPresence] = useState<NodePresence>('any')
-  const [chips, setChips] = useState<LabelChip[]>([])
-  const [picked, setPicked] = useState<Record<string, boolean>>({})
+  const [pick, setPick] = useState<PickerState>(emptyPick)
+  const [refreshKey, setRefreshKey] = useState(0)
+  const [drift, setDrift] = useState<{ added: string[]; removed: string[] } | null>(
+    null,
+  )
   const [loadedVersion, setLoadedVersion] = useState<{
     key: string
     detail: SkillVersionDetail | null
@@ -92,49 +83,6 @@ export function SkillChangeDialog({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose, submitting])
-
-  useEffect(() => {
-    let cancelled = false
-    api
-      .listNodes()
-      .then(async (list) => {
-        if (cancelled) return
-        setNodes(list)
-        setNodesLoading(false)
-        const pairs = await Promise.all(
-          list.map(async (node) => {
-            try {
-              const body = await api.getNodeSkills(node.node_id)
-              const item = body.items.find((row) => row.name === skillName)
-              return [
-                node.node_id,
-                {
-                  desired: item?.desired_version ?? null,
-                  actual: item?.actual_version ?? null,
-                },
-              ] as const
-            } catch {
-              return [
-                node.node_id,
-                { desired: null, actual: null },
-              ] as const
-            }
-          }),
-        )
-        if (cancelled) return
-        const next: Record<string, { desired: string | null; actual: string | null }> = {}
-        for (const [id, versions] of pairs) next[id] = versions
-        setCurrentVersion(next)
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return
-        setNodesLoading(false)
-        setNodesError(err instanceof Error ? err : new Error(String(err)))
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [skillName])
 
   const versionKey = `${action}\n${skillName}\n${version}\n${reloadTick}`
 
@@ -161,19 +109,6 @@ export function SkillChangeDialog({
     }
   }, [action, skillName, version, reloadTick, versionKey])
 
-  const labels = selectorLabels(chips)
-  const hasSelector = Object.keys(labels).length > 0
-  const handPicked = Object.entries(picked)
-    .filter(([, on]) => on)
-    .map(([id]) => id)
-    .sort()
-  const target = installTarget({ handPicked, labels })
-  const canTarget = target.node_ids.length > 0 || target.selector != null
-  const chipsAvailable = useMemo(() => labelChipsFromNodes(nodes), [nodes])
-  const visible = filterNodes(nodes, { search, status: presence, labels: {} })
-  const labelHits = hasSelector
-    ? nodes.filter((node) => labelsMatch(nodeLabelMap(node.labels), labels))
-    : []
   const versionMatches = loadedVersion?.key === versionKey
   const versionDetail = versionMatches ? loadedVersion.detail : null
   const versionError = versionMatches ? loadedVersion.error : null
@@ -196,44 +131,40 @@ export function SkillChangeDialog({
     if (next) setStep(next)
   }
 
-  function selectAllMatching() {
-    const ids = filterNodes(nodes, { search, status: presence, labels }).map(
-      (node) => node.node_id,
-    )
-    setPicked((prev) => {
-      const next = { ...prev }
-      for (const id of ids) next[id] = true
-      return next
-    })
-  }
-
   async function submit(forceOverride?: boolean) {
-    if (!canTarget || submitting || (action === 'install' && !hashReady)) return
+    if (!pick.ready || !pick.target || submitting || (action === 'install' && !hashReady)) {
+      return
+    }
     const useForce = forceOverride ?? force
     setSubmitting(true)
     setSubmitError(null)
     setInUse(null)
     try {
+      const target = pick.target
+      const confirm = pick.confirmProd
+        ? { confirm_prod: pick.confirmProd }
+        : {}
       const response =
         action === 'install'
           ? await api.installSkill(skillName, {
               version,
-              node_ids: target.node_ids,
-              ...(target.selector ? { selector: target.selector } : {}),
+              target,
+              ...confirm,
               accepted_capabilities_sha256: displayedHash,
             })
           : action === 'rollback'
             ? await api.rollbackSkill(skillName, {
-                node_ids: target.node_ids,
-                ...(target.selector ? { selector: target.selector } : {}),
+                target,
+                ...confirm,
                 ...(version ? { to_version: version } : {}),
               })
             : await api.uninstallSkill(skillName, {
-                node_ids: target.node_ids,
-                ...(target.selector ? { selector: target.selector } : {}),
+                target,
+                ...confirm,
                 force: useForce,
               })
       setCapChanged(null)
+      setDrift(null)
       setResult(response)
     } catch (err) {
       if (action === 'install' && isCapabilitiesChanged(err)) {
@@ -244,6 +175,16 @@ export function SkillChangeDialog({
         setReviewedKey(null)
         setReloadTick((n) => n + 1)
         setStep('capabilities')
+        return
+      }
+      const changed = targetChangedDetail(err)
+      if (changed) {
+        setDrift(changed)
+        setRefreshKey((n) => n + 1)
+        setStep('nodes')
+        setSubmitError(
+          new Error('409 target_changed. Preview again, then confirm.'),
+        )
         return
       }
       const refs = skillInUseRefs(err)
@@ -268,8 +209,9 @@ export function SkillChangeDialog({
 
   const nextDisabled =
     (step === 'version' && action === 'install' && !version) ||
-    (step === 'nodes' && !canTarget) ||
+    (step === 'nodes' && !pick.ready) ||
     (step === 'capabilities' && (!reviewed || !hashReady))
+  const matched = pick.preview?.node_ids ?? []
 
   return (
     <div className="dialog-backdrop">
@@ -356,30 +298,23 @@ export function SkillChangeDialog({
             ) : null}
 
             {step === 'nodes' ? (
-              <NodePicker
-                nodesLoading={nodesLoading}
-                nodesError={nodesError}
-                chipsAvailable={chipsAvailable}
-                chips={chips}
-                onToggleChip={(chip) =>
-                  setChips((prev) => toggleLabelChip(prev, chip))
-                }
-                search={search}
-                onSearch={setSearch}
-                presence={presence}
-                onPresence={setPresence}
-                visible={visible}
-                picked={picked}
-                onToggleNode={(id) =>
-                  setPicked((prev) => ({ ...prev, [id]: !prev[id] }))
-                }
-                onSelectMatching={selectAllMatching}
-                onClear={() => setPicked({})}
-                labels={labels}
-                currentVersion={currentVersion}
-                handPicked={handPicked}
-                labelHits={labelHits.map((node) => node.node_id)}
-              />
+              <div>
+                <TargetPicker
+                  onChange={setPick}
+                  refreshKey={refreshKey}
+                  disabled={submitting}
+                />
+                {drift ? (
+                  <div className="alert alert-error" role="alert">
+                    <strong>409 target_changed</strong>
+                    <div>
+                      Added {drift.added.join(', ') || 'none'}. Removed{' '}
+                      {drift.removed.join(', ') || 'none'}. The preview was
+                      refreshed. Confirm again after it settles.
+                    </div>
+                  </div>
+                ) : null}
+              </div>
             ) : null}
 
             {step === 'capabilities' ? (
@@ -450,6 +385,16 @@ export function SkillChangeDialog({
                     <div>{capChanged}</div>
                   </div>
                 ) : null}
+                {drift ? (
+                  <div className="alert alert-error" role="alert">
+                    <strong>409 target_changed</strong>
+                    <div>
+                      Added {drift.added.join(', ') || 'none'}. Removed{' '}
+                      {drift.removed.join(', ') || 'none'}. Go back and preview
+                      again.
+                    </div>
+                  </div>
+                ) : null}
                 <p>
                   {action === 'install'
                     ? `Install ${skillName} ${version}.`
@@ -458,17 +403,15 @@ export function SkillChangeDialog({
                       : `Uninstall ${skillName}.`}
                 </p>
                 <dl className="kv">
-                  <dt>node_ids</dt>
+                  <dt>target</dt>
                   <dd className="mono">
-                    {target.node_ids.length > 0 ? target.node_ids.join(', ') : '—'}
+                    {pick.target?.selector
+                      ? pick.target.selector
+                      : pick.target?.node_ids?.join(', ') || '—'}
                   </dd>
-                  <dt>selector.labels</dt>
+                  <dt>matched</dt>
                   <dd className="mono">
-                    {target.selector
-                      ? Object.entries(target.selector.labels)
-                          .map(([key, value]) => `${key}=${value}`)
-                          .join(', ')
-                      : 'not sent'}
+                    {matched.length > 0 ? matched.join(', ') : '—'}
                   </dd>
                   {action === 'install' ? (
                     <>
@@ -477,21 +420,9 @@ export function SkillChangeDialog({
                     </>
                   ) : null}
                 </dl>
-                {hasSelector ? (
-                  <p className="muted small">
-                    The label filter is sent as <code>selector.labels</code>.
-                    Loaded nodes that match:{' '}
-                    {labelHits.length > 0
-                      ? labelHits.map((node) => node.node_id).join(', ')
-                      : 'none'}
-                    . Search does not narrow that selector.
-                  </p>
-                ) : null}
                 <p className="muted small">
-                  A node the center sees as offline returns{' '}
-                  <strong>queued</strong>. A node already on this version
-                  returns <strong>already installed</strong>, and its desired
-                  generation stays the same.
+                  The matched list is frozen when you confirm. A node the center
+                  sees as offline returns <strong>queued</strong>.
                 </p>
                 {action === 'install' && grants.length > 0 ? (
                   <ul className="cap-list">
@@ -551,7 +482,12 @@ export function SkillChangeDialog({
               ) : (
                 <Button
                   onClick={() => void submit()}
-                  disabled={submitting || !canTarget || !hashReady || (action === 'install' && !reviewed)}
+                  disabled={
+                    submitting ||
+                    !pick.ready ||
+                    !hashReady ||
+                    (action === 'install' && !reviewed)
+                  }
                 >
                   {submitting ? 'Sending…' : 'Confirm'}
                 </Button>
@@ -577,183 +513,6 @@ function stepLabel(step: Step): string {
   }
 }
 
-function NodePicker({
-  nodesLoading,
-  nodesError,
-  chipsAvailable,
-  chips,
-  onToggleChip,
-  search,
-  onSearch,
-  presence,
-  onPresence,
-  visible,
-  picked,
-  onToggleNode,
-  onSelectMatching,
-  onClear,
-  labels,
-  currentVersion,
-  handPicked,
-  labelHits,
-}: {
-  nodesLoading: boolean
-  nodesError: Error | null
-  chipsAvailable: LabelChip[]
-  chips: LabelChip[]
-  onToggleChip: (chip: LabelChip) => void
-  search: string
-  onSearch: (value: string) => void
-  presence: NodePresence
-  onPresence: (value: NodePresence) => void
-  visible: NodePick[]
-  picked: Record<string, boolean>
-  onToggleNode: (id: string) => void
-  onSelectMatching: () => void
-  onClear: () => void
-  labels: Record<string, string>
-  currentVersion: Record<string, { desired: string | null; actual: string | null }>
-  handPicked: string[]
-  labelHits: string[]
-}) {
-  const active = new Set(chips.map((chip) => chip.id))
-  const hasSelector = Object.keys(labels).length > 0
-  return (
-    <div>
-      <p className="muted small">
-        Hand-picked nodes are sent as <code>node_ids</code>. An active label
-        chip is sent as <code>selector.labels</code>, not as a tag.
-      </p>
-      <label className="field">
-        <span className="field-label">Search</span>
-        <input
-          className="input"
-          value={search}
-          onChange={(event) => onSearch(event.target.value)}
-          placeholder="Node id, hostname, or label"
-        />
-      </label>
-      <label className="field">
-        <span className="field-label">Status</span>
-        <select
-          className="input"
-          value={presence}
-          onChange={(event) => onPresence(event.target.value as NodePresence)}
-        >
-          <option value="any">Any</option>
-          <option value="seen">Seen</option>
-          <option value="never_seen">Never seen</option>
-        </select>
-      </label>
-      <div className="field">
-        <span className="field-label">Label filter</span>
-        {chipsAvailable.length === 0 ? (
-          <p className="muted small">No label pairs on the loaded nodes.</p>
-        ) : (
-          <div className="chip-row">
-            {chipsAvailable.map((chip) => (
-              <button
-                key={chip.id}
-                type="button"
-                className={active.has(chip.id) ? 'chip chip-on' : 'chip'}
-                aria-pressed={active.has(chip.id)}
-                onClick={() => onToggleChip(chip)}
-              >
-                {chip.key}={chip.value}
-              </button>
-            ))}
-          </div>
-        )}
-        <p className="muted small">
-          One value per label key. <code>role=db</code> includes every node
-          whose <code>labels.role</code> is <code>db</code>.
-        </p>
-      </div>
-      <div className="row-gap" style={{ marginBottom: '0.75rem' }}>
-        <Button variant="ghost" onClick={onSelectMatching}>
-          Select all matching filter
-        </Button>
-        <Button variant="ghost" onClick={onClear}>
-          Clear hand-picked
-        </Button>
-      </div>
-      {nodesLoading ? <Loading label="Loading nodes…" /> : null}
-      {nodesError ? <ErrorBanner error={nodesError} /> : null}
-      {!nodesLoading && visible.length === 0 ? (
-        <p className="muted">No nodes match the search and status filter.</p>
-      ) : null}
-      {visible.length > 0 ? (
-        <div className="table-wrap">
-          <table className="data-table">
-            <thead>
-              <tr>
-                <th>Hand-pick</th>
-                <th>Node</th>
-                <th>Labels</th>
-                <th>Status</th>
-                <th>Current version</th>
-              </tr>
-            </thead>
-            <tbody>
-              {visible.map((node) => {
-                const nodeLabels = nodeLabelMap(node.labels)
-                const included =
-                  hasSelector && labelsMatch(nodeLabels, labels)
-                const versions = currentVersion[node.node_id]
-                return (
-                  <tr key={node.node_id} className={included ? 'row-label' : undefined}>
-                    <td>
-                      <input
-                        type="checkbox"
-                        checked={!!picked[node.node_id]}
-                        aria-label={`Hand-pick ${node.node_id}`}
-                        onChange={() => onToggleNode(node.node_id)}
-                      />
-                    </td>
-                    <td>
-                      <div className="mono">{node.node_id}</div>
-                      <div className="muted small">{node.hostname || '—'}</div>
-                      {included ? (
-                        <div className="small">Included by label filter</div>
-                      ) : null}
-                    </td>
-                    <td className="mono small">
-                      {Object.entries(nodeLabels)
-                        .map(([key, value]) => `${key}=${value}`)
-                        .join(' ') || '—'}
-                    </td>
-                    <td className="nowrap">
-                      {node.last_seen_at ? `Seen ${formatTime(node.last_seen_at)}` : 'Never seen'}
-                    </td>
-                    <td className="mono">
-                      {versions === undefined ? (
-                        '…'
-                      ) : (
-                        <>
-                          <div>{versions.desired || '—'}</div>
-                          {versions.actual && versions.actual !== versions.desired ? (
-                            <div className="muted small">actual {versions.actual}</div>
-                          ) : null}
-                        </>
-                      )}
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
-      ) : null}
-      <p className="muted small">
-        Hand-picked: {handPicked.length > 0 ? handPicked.join(', ') : 'none'}.
-        Label filter:{' '}
-        {labelHits.length > 0 ? labelHits.join(', ') : hasSelector ? 'none loaded' : 'off'}
-        .
-      </p>
-    </div>
-  )
-}
-
 function ChangeResult({ result }: { result: SkillChangeResponse }) {
   const already = result.per_node.filter((row) => row.outcome === 'already_installed')
   const changed = result.per_node.some((row) => generationChanged(row.outcome))
@@ -765,6 +524,12 @@ function ChangeResult({ result }: { result: SkillChangeResponse }) {
       {result.operation_id ? (
         <p className="muted small">
           Operation <code>{result.operation_id}</code> was recorded.
+          {result.resolution_id ? (
+            <>
+              {' '}
+              Resolution <code>{result.resolution_id}</code>.
+            </>
+          ) : null}
           {already.length > 0
             ? ' An operation record does not mean the desired generation changed.'
             : ''}
