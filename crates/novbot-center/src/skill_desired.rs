@@ -42,6 +42,7 @@ pub(crate) enum DesiredError {
     BundleExists,
     InvalidBundle(String),
     BadRequest(String),
+    Target(crate::targets::TargetError),
     Internal(anyhow::Error),
 }
 
@@ -82,6 +83,10 @@ pub(crate) struct InstallRequest {
     #[serde(default)]
     pub selector: Option<SelectorBody>,
     #[serde(default)]
+    pub target: Option<crate::targets::TargetBody>,
+    #[serde(default)]
+    pub confirm_prod: Option<crate::targets::ConfirmProd>,
+    #[serde(default)]
     pub accepted_capabilities_sha256: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
@@ -94,6 +99,10 @@ pub(crate) struct RollbackRequest {
     #[serde(default)]
     pub selector: Option<SelectorBody>,
     #[serde(default)]
+    pub target: Option<crate::targets::TargetBody>,
+    #[serde(default)]
+    pub confirm_prod: Option<crate::targets::ConfirmProd>,
+    #[serde(default)]
     pub to_version: Option<String>,
 }
 
@@ -103,6 +112,10 @@ pub(crate) struct UninstallRequest {
     pub node_ids: Vec<String>,
     #[serde(default)]
     pub selector: Option<SelectorBody>,
+    #[serde(default)]
+    pub target: Option<crate::targets::TargetBody>,
+    #[serde(default)]
+    pub confirm_prod: Option<crate::targets::ConfirmProd>,
     #[serde(default)]
     pub force: bool,
 }
@@ -117,6 +130,8 @@ pub(crate) struct PerNode {
 #[derive(Debug, Serialize)]
 pub(crate) struct ChangeResponse {
     pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_id: Option<String>,
     pub dry_run: bool,
     pub per_node: Vec<PerNode>,
 }
@@ -135,6 +150,7 @@ pub(crate) struct InstallPlan {
 pub(crate) struct SkillChange {
     pub skill_name: String,
     pub operation_id: Option<String>,
+    pub resolution_id: Option<String>,
     pub per_node: Vec<PerNode>,
 }
 
@@ -319,8 +335,17 @@ pub(crate) async fn install(
         min_node_version: version.min_node_version.clone(),
         platforms: version.platforms.clone(),
     };
-    let selection = Selection::new(body.node_ids, body.selector);
-    let batch = apply_installs(db, hub, vec![plan], selection, body.dry_run).await?;
+    let aim = prepare_skill_aim(
+        db,
+        hub,
+        body.target,
+        body.node_ids,
+        body.selector,
+        body.confirm_prod,
+        name,
+    )
+    .await?;
+    let batch = apply_installs(db, hub, vec![plan], aim, body.dry_run).await?;
     let change = batch
         .changes
         .into_iter()
@@ -328,6 +353,7 @@ pub(crate) async fn install(
         .ok_or_else(|| DesiredError::Internal(anyhow::anyhow!("install plan missing")))?;
     Ok(ChangeResponse {
         operation_id: change.operation_id,
+        resolution_id: change.resolution_id,
         dry_run: body.dry_run,
         per_node: change.per_node,
     })
@@ -361,13 +387,27 @@ pub(crate) async fn rollback(
         }
         None => None,
     };
-    let selection = Selection::new(body.node_ids, body.selector);
-    let (mut tx, slots) = prepare(db, &selection).await?;
+    let aim = prepare_skill_aim(
+        db,
+        hub,
+        body.target,
+        body.node_ids,
+        body.selector,
+        body.confirm_prod,
+        name,
+    )
+    .await?;
+    let (mut tx, slots) = prepare(db, &aim.selection).await?;
+    if let Err(err) = guard_aim(db, &slots, &aim).await {
+        let _ = tx.rollback().await;
+        return Err(err);
+    }
     if slots.iter().all(Slot::is_missing) {
         let per_node = missing_per_node(&slots);
         tx.rollback().await.map_err(db_err)?;
         return Ok(ChangeResponse {
             operation_id: None,
+            resolution_id: None,
             dry_run: false,
             per_node,
         });
@@ -388,7 +428,7 @@ pub(crate) async fn rollback(
         return Err(DesiredError::NoPreviousVersion);
     }
     let version = rollback_version(explicit.as_ref(), &plans);
-    let operation_id = persist(
+    let (operation_id, resolution_id) = persist(
         &mut tx,
         name,
         "rollback",
@@ -396,12 +436,14 @@ pub(crate) async fn rollback(
         None,
         false,
         &plans,
+        aim.snapshot.as_ref(),
     )
     .await?;
     let per_node = per_nodes(&plans);
     tx.commit().await.map_err(db_err)?;
     Ok(ChangeResponse {
         operation_id: Some(operation_id),
+        resolution_id,
         dry_run: false,
         per_node,
     })
@@ -417,13 +459,27 @@ pub(crate) async fn uninstall(
         return Err(DesiredError::BuiltinReadOnly);
     }
     require_versions(db, name).await?;
-    let selection = Selection::new(body.node_ids, body.selector);
-    let (mut tx, slots) = prepare(db, &selection).await?;
+    let aim = prepare_skill_aim(
+        db,
+        hub,
+        body.target,
+        body.node_ids,
+        body.selector,
+        body.confirm_prod,
+        name,
+    )
+    .await?;
+    let (mut tx, slots) = prepare(db, &aim.selection).await?;
+    if let Err(err) = guard_aim(db, &slots, &aim).await {
+        let _ = tx.rollback().await;
+        return Err(err);
+    }
     if slots.iter().all(Slot::is_missing) {
         let per_node = missing_per_node(&slots);
         tx.rollback().await.map_err(db_err)?;
         return Ok(ChangeResponse {
             operation_id: None,
+            resolution_id: None,
             dry_run: false,
             per_node,
         });
@@ -444,29 +500,137 @@ pub(crate) async fn uninstall(
         .iter()
         .map(|slot| classify_uninstall(slot, &desired, &gens, hub))
         .collect();
-    let operation_id = persist(&mut tx, name, "uninstall", None, None, body.force, &plans).await?;
+    let (operation_id, resolution_id) = persist(
+        &mut tx,
+        name,
+        "uninstall",
+        None,
+        None,
+        body.force,
+        &plans,
+        aim.snapshot.as_ref(),
+    )
+    .await?;
     let per_node = per_nodes(&plans);
     tx.commit().await.map_err(db_err)?;
     Ok(ChangeResponse {
         operation_id: Some(operation_id),
+        resolution_id,
         dry_run: false,
         per_node,
     })
+}
+
+pub(crate) struct SkillAim {
+    pub selection: Selection,
+    pub snapshot: Option<crate::targets::Frozen>,
+    pub confirm: Option<crate::targets::ConfirmProd>,
+    pub audit_id: String,
+}
+
+pub(crate) async fn prepare_skill_aim(
+    db: &Db,
+    hub: &Hub,
+    target: Option<crate::targets::TargetBody>,
+    node_ids: Vec<String>,
+    selector: Option<SelectorBody>,
+    confirm: Option<crate::targets::ConfirmProd>,
+    audit_id: &str,
+) -> Result<SkillAim, DesiredError> {
+    if let Some(target) = target {
+        if crate::targets::has_mode(&target) {
+            let frozen = crate::targets::check_submit(
+                db,
+                hub,
+                &target,
+                confirm.as_ref(),
+                "skill_operation",
+                audit_id,
+            )
+            .await
+            .map_err(DesiredError::Target)?;
+            let ids = frozen.node_ids.clone();
+            return Ok(SkillAim {
+                selection: Selection::new(ids, None),
+                snapshot: Some(frozen),
+                confirm,
+                audit_id: audit_id.to_string(),
+            });
+        }
+    }
+    if selector.is_some() {
+        return Ok(SkillAim {
+            selection: Selection::new(node_ids, selector),
+            snapshot: None,
+            confirm,
+            audit_id: audit_id.to_string(),
+        });
+    }
+    if node_ids.iter().any(|id| !id.trim().is_empty()) {
+        let body = crate::targets::TargetBody {
+            selector: None,
+            node_ids: Some(node_ids),
+            exclude_node_ids: Vec::new(),
+            expected_node_ids: None,
+        };
+        let frozen = crate::targets::check_submit(
+            db,
+            hub,
+            &body,
+            confirm.as_ref(),
+            "skill_operation",
+            audit_id,
+        )
+        .await
+        .map_err(DesiredError::Target)?;
+        let ids = frozen.node_ids.clone();
+        return Ok(SkillAim {
+            selection: Selection::new(ids, None),
+            snapshot: Some(frozen),
+            confirm,
+            audit_id: audit_id.to_string(),
+        });
+    }
+    Err(DesiredError::NoTargetNodes)
+}
+
+async fn guard_aim(db: &Db, slots: &[Slot], aim: &SkillAim) -> Result<(), DesiredError> {
+    if aim.snapshot.is_some() {
+        return Ok(());
+    }
+    let ids: Vec<String> = slots
+        .iter()
+        .filter(|slot| !slot.is_missing())
+        .map(|slot| slot.id().to_string())
+        .collect();
+    crate::targets::ensure_prod_confirm(
+        db,
+        &ids,
+        aim.confirm.as_ref(),
+        "skill_operation",
+        &aim.audit_id,
+    )
+    .await
+    .map_err(DesiredError::Target)
 }
 
 pub(crate) async fn apply_installs(
     db: &Db,
     hub: &Hub,
     plans: Vec<InstallPlan>,
-    selection: Selection,
+    aim: SkillAim,
     dry_run: bool,
 ) -> Result<BatchResult, DesiredError> {
-    let (mut tx, slots) = prepare(db, &selection).await?;
+    let (mut tx, slots) = prepare(db, &aim.selection).await?;
+    if let Err(err) = guard_aim(db, &slots, &aim).await {
+        let _ = tx.rollback().await;
+        return Err(err);
+    }
     let read_only = dry_run || slots.iter().all(Slot::is_missing) || plans.is_empty();
     let changes = if read_only {
         preview_installs(&mut tx, hub, &plans, &slots).await?
     } else {
-        write_installs(&mut tx, hub, &plans, &slots).await?
+        write_installs(&mut tx, hub, &plans, &slots, aim.snapshot.as_ref()).await?
     };
     let targets = target_views(&mut tx, &slots).await?;
     if read_only {
@@ -898,6 +1062,7 @@ async fn preview_installs(
         changes.push(SkillChange {
             skill_name: plan.skill_name.clone(),
             operation_id: None,
+            resolution_id: None,
             per_node: per_nodes(&node_plans),
         });
     }
@@ -909,6 +1074,7 @@ async fn write_installs(
     hub: &Hub,
     plans: &[InstallPlan],
     slots: &[Slot],
+    snapshot: Option<&crate::targets::Frozen>,
 ) -> Result<Vec<SkillChange>, DesiredError> {
     let mut changes = Vec::with_capacity(plans.len());
     for plan in plans {
@@ -923,9 +1089,9 @@ async fn write_installs(
         } else {
             "install"
         };
-        let operation_id = if node_plans.iter().any(|plan| plan.outcome != "node_unknown") {
-            Some(
-                persist(
+        let (operation_id, resolution_id) =
+            if node_plans.iter().any(|plan| plan.outcome != "node_unknown") {
+                let (operation_id, resolution_id) = persist(
                     tx,
                     &plan.skill_name,
                     op_type,
@@ -933,15 +1099,17 @@ async fn write_installs(
                     Some(&plan.capabilities_sha256),
                     false,
                     &node_plans,
+                    snapshot,
                 )
-                .await?,
-            )
-        } else {
-            None
-        };
+                .await?;
+                (Some(operation_id), resolution_id)
+            } else {
+                (None, None)
+            };
         changes.push(SkillChange {
             skill_name: plan.skill_name.clone(),
             operation_id,
+            resolution_id,
             per_node: per_nodes(&node_plans),
         });
     }
@@ -1158,7 +1326,8 @@ async fn persist(
     capabilities_sha256: Option<&str>,
     force: bool,
     plans: &[NodePlan],
-) -> Result<String, DesiredError> {
+    snapshot: Option<&crate::targets::Frozen>,
+) -> Result<(String, Option<String>), DesiredError> {
     lock_chain(tx).await?;
     let operation_id = Uuid::new_v4().to_string();
     for plan in plans {
@@ -1206,8 +1375,23 @@ async fn persist(
     .execute(tx.deref_mut())
     .await
     .map_err(db_err)?;
+    let resolution_id = match snapshot {
+        Some(frozen) => Some(
+            crate::targets::insert_resolution(
+                tx.deref_mut(),
+                "skill_operation",
+                &operation_id,
+                frozen,
+                None,
+            )
+            .await
+            .map_err(DesiredError::Target)?,
+        ),
+        None => None,
+    };
     let detail = serde_json::json!({
         "operation_id": &operation_id,
+        "resolution_id": resolution_id,
         "skill_name": skill_name,
         "version": version,
         "per_node": per_node,
@@ -1222,7 +1406,7 @@ async fn persist(
         &detail_json,
     )
     .await?;
-    Ok(operation_id)
+    Ok((operation_id, resolution_id))
 }
 
 async fn lock_chain(tx: &mut Tx<'_>) -> Result<(), DesiredError> {
@@ -2746,6 +2930,51 @@ mod http_tests {
         assert_eq!(desired["state"], "queued");
         assert_eq!(desired["source"], "hub");
         assert_eq!(desired["desired_version"], "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn install_target_freezes_resolution() {
+        let Some(db) = connect_test_db().await else {
+            return;
+        };
+        let name = unique("t");
+        let skill = publish(&db, &name, "1.0.0").await;
+        let tid = format!("t{}", uuid::Uuid::new_v4().simple());
+        let node_id = unique("ntb");
+        let mut tags = HashMap::new();
+        tags.insert("tid".to_string(), tid.clone());
+        crate::tags::register_node(&db, &node_id, "host", "0.1.0", &tags, "linux", "arm64")
+            .await
+            .expect("register");
+        let (status, bytes) = call(
+            app(&db),
+            json_req(
+                "POST",
+                &format!("/v1/skills/{}/install", skill.name),
+                json!({
+                    "version": skill.version,
+                    "target": { "selector": format!("tid={tid}") },
+                    "accepted_capabilities_sha256": skill.capabilities_sha256,
+                }),
+            ),
+        )
+        .await;
+        let body = expect_json(status, &bytes, StatusCode::ACCEPTED);
+        let operation_id = body["operation_id"].as_str().expect("operation");
+        let resolution_id = body["resolution_id"].as_str().expect("resolution");
+        assert_eq!(node_outcome(&body, &node_id)["outcome"], "queued");
+        let row =
+            sqlx::query("SELECT node_ids_json, kind, ref_id FROM target_resolutions WHERE id = ?")
+                .bind(resolution_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("resolution row");
+        let kind: String = row.try_get("kind").unwrap();
+        let ref_id: String = row.try_get("ref_id").unwrap();
+        let ids: String = row.try_get("node_ids_json").unwrap();
+        assert_eq!(kind, "skill_operation");
+        assert_eq!(ref_id, operation_id);
+        assert!(ids.contains(&node_id), "{ids}");
     }
 
     fn delete_req(uri: &str) -> Request<Body> {

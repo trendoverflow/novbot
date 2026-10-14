@@ -134,6 +134,10 @@ impl Db {
                 "006_node_tags.sql",
                 include_str!("../migrations/006_node_tags.sql"),
             ),
+            (
+                "007_target_resolutions.sql",
+                include_str!("../migrations/007_target_resolutions.sql"),
+            ),
         ] {
             for stmt in split_sql(sql) {
                 sqlx::query(stmt)

@@ -8,6 +8,7 @@ use crate::skill_catalog::{self, HubSkillItem, SkillDetail, VersionDetail};
 use crate::skill_delivery;
 use crate::skill_desired;
 use crate::tags;
+use crate::targets;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, Query, Request, State};
@@ -78,6 +79,24 @@ pub fn router(state: AppState) -> Router {
         .route("/skill-capabilities", get(list_skill_capabilities))
         .route("/tags", get(list_tag_overview))
         .route("/tags/bulk", post(bulk_tags))
+        .route("/targets/resolve", post(resolve_target))
+        .route("/dispatch", post(dispatch_target))
+        .route("/dispatch-operations", get(list_dispatch_operations))
+        .route("/dispatch-operations/{id}", get(get_dispatch_operation))
+        .route(
+            "/schedules",
+            get(list_target_schedules).post(create_target_schedule),
+        )
+        .route(
+            "/schedules/{id}",
+            get(get_target_schedule)
+                .patch(patch_target_schedule)
+                .delete(delete_target_schedule),
+        )
+        .route(
+            "/schedules/{id}/re-resolve",
+            post(reresolve_target_schedule),
+        )
         .route("/audit-events", get(list_audit_events))
         .route(
             "/skill-bundles",
@@ -375,7 +394,12 @@ async fn install_skill_bundle(
 
 #[derive(Debug, Deserialize)]
 struct RunBundleBody {
+    #[serde(default)]
     node_ids: Vec<String>,
+    #[serde(default)]
+    target: Option<targets::TargetBody>,
+    #[serde(default)]
+    confirm_prod: Option<targets::ConfirmProd>,
 }
 
 async fn run_skill_bundle(
@@ -384,10 +408,22 @@ async fn run_skill_bundle(
     Json(body): Json<RunBundleBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let group = skill_bundles::fleet_group(&st.db, &id).await?;
-    if body.node_ids.is_empty() {
-        return Err(ApiError::bad_request("node_ids must not be empty"));
-    }
-    let results = dispatch_named_skills(&st, &group.skills, &body.node_ids).await?;
+    let target = targets::coalesce_target(body.target, body.node_ids)?;
+    let frozen = targets::check_submit(
+        &st.db,
+        &st.hub,
+        &target,
+        body.confirm_prod.as_ref(),
+        "dispatch",
+        &group.id,
+    )
+    .await?;
+    let push_id = Uuid::new_v4().to_string();
+    let resolution_id =
+        targets::store_resolution(&st.db, "dispatch", &push_id, &frozen, None).await?;
+    let results = dispatch_named_skills(&st, &group.skills, &frozen.node_ids).await?;
+    let mut resolution = resolution_body(&frozen);
+    resolution.insert("id".to_string(), serde_json::json!(resolution_id));
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
@@ -397,6 +433,7 @@ async fn run_skill_bundle(
             "group_name": group.name,
             "skills": group.skills,
             "results": results,
+            "resolution": resolution,
         })),
     ))
 }
@@ -452,7 +489,12 @@ async fn list_skill_groups(State(st): State<AppState>) -> Result<Json<Value>, Ap
 #[derive(Debug, Deserialize)]
 pub struct PushSkillGroupBody {
     pub group_id: String,
+    #[serde(default)]
     pub node_ids: Vec<String>,
+    #[serde(default)]
+    pub target: Option<targets::TargetBody>,
+    #[serde(default)]
+    pub confirm_prod: Option<targets::ConfirmProd>,
 }
 
 fn resolve_spec_id_for_skill(specs: &Value, skill: &str) -> String {
@@ -482,10 +524,22 @@ async fn push_skill_group(
     Json(body): Json<PushSkillGroupBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let group = skill_bundles::fleet_group(&st.db, &body.group_id).await?;
-    if body.node_ids.is_empty() {
-        return Err(ApiError::bad_request("node_ids must not be empty"));
-    }
-    let results = dispatch_named_skills(&st, &group.skills, &body.node_ids).await?;
+    let target = targets::coalesce_target(body.target, body.node_ids)?;
+    let frozen = targets::check_submit(
+        &st.db,
+        &st.hub,
+        &target,
+        body.confirm_prod.as_ref(),
+        "dispatch",
+        &group.id,
+    )
+    .await?;
+    let push_id = Uuid::new_v4().to_string();
+    let resolution_id =
+        targets::store_resolution(&st.db, "dispatch", &push_id, &frozen, None).await?;
+    let results = dispatch_named_skills(&st, &group.skills, &frozen.node_ids).await?;
+    let mut resolution = resolution_body(&frozen);
+    resolution.insert("id".to_string(), serde_json::json!(resolution_id));
     Ok((
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
@@ -494,8 +548,23 @@ async fn push_skill_group(
             "group_name": group.name,
             "skills": group.skills,
             "results": results,
+            "resolution": resolution,
         })),
     ))
+}
+
+fn resolution_body(frozen: &targets::Frozen) -> serde_json::Map<String, Value> {
+    let mut resolution = serde_json::json!({
+        "selector": frozen.selector,
+        "resolved_at": frozen.resolved_at,
+        "node_ids": frozen.node_ids,
+        "excluded_node_ids": frozen.excluded_node_ids,
+        "count": frozen.node_ids.len(),
+        "prod_node_ids": frozen.prod_node_ids,
+        "prod_node_count": frozen.prod_node_ids.len(),
+        "resolution_sha256": frozen.resolution_sha256,
+    });
+    resolution.as_object_mut().cloned().unwrap_or_default()
 }
 
 async fn dispatch_named_skills(
@@ -637,6 +706,92 @@ async fn bulk_tags(
     Ok(Json(tags::bulk(&st.db, body).await?))
 }
 
+#[derive(Debug, Deserialize)]
+struct ResolveTargetBody {
+    target: targets::TargetBody,
+}
+
+async fn resolve_target(
+    State(st): State<AppState>,
+    Json(body): Json<ResolveTargetBody>,
+) -> Result<Json<targets::ResolutionView>, ApiError> {
+    Ok(Json(targets::preview(&st.db, &st.hub, &body.target).await?))
+}
+
+async fn dispatch_target(
+    State(st): State<AppState>,
+    Json(body): Json<targets::DispatchRequest>,
+) -> Result<(StatusCode, Json<targets::DispatchOutcome>), ApiError> {
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(targets::dispatch_target(&st.db, &st.hub, body).await?),
+    ))
+}
+
+async fn list_dispatch_operations(
+    State(st): State<AppState>,
+) -> Result<Json<targets::DispatchOperationList>, ApiError> {
+    Ok(Json(targets::list_dispatch_operations(&st.db).await?))
+}
+
+async fn get_dispatch_operation(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<targets::DispatchOperationView>, ApiError> {
+    Ok(Json(targets::get_dispatch_operation(&st.db, &id).await?))
+}
+
+async fn list_target_schedules(
+    State(st): State<AppState>,
+) -> Result<Json<targets::ScheduleList>, ApiError> {
+    Ok(Json(targets::list_schedules(&st.db, &st.hub).await?))
+}
+
+async fn create_target_schedule(
+    State(st): State<AppState>,
+    Json(body): Json<targets::CreateScheduleRequest>,
+) -> Result<(StatusCode, Json<targets::ScheduleCreateResponse>), ApiError> {
+    Ok((
+        StatusCode::CREATED,
+        Json(targets::create_schedule(&st.db, &st.hub, body).await?),
+    ))
+}
+
+async fn get_target_schedule(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<targets::ScheduleView>, ApiError> {
+    Ok(Json(targets::get_schedule(&st.db, &st.hub, &id).await?))
+}
+
+async fn patch_target_schedule(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<targets::PatchScheduleRequest>,
+) -> Result<Json<targets::ScheduleView>, ApiError> {
+    Ok(Json(
+        targets::patch_schedule(&st.db, &st.hub, &id, body).await?,
+    ))
+}
+
+async fn delete_target_schedule(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    targets::delete_schedule(&st.db, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn reresolve_target_schedule(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<targets::ReResolveRequest>,
+) -> Result<Json<targets::ReResolveResponse>, ApiError> {
+    Ok(Json(
+        targets::re_resolve_schedule(&st.db, &st.hub, &id, body).await?,
+    ))
+}
+
 async fn get_config(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -706,6 +861,7 @@ async fn put_schedules(
 ) -> Result<Json<NodeConfig>, ApiError> {
     let schedules_json = serde_json::to_string(&body.schedules)?;
     let cfg = st.db.put_schedules(&id, &schedules_json).await?;
+    targets::note_node_schedule_edit(&st.db, &id, &schedules_json).await?;
     Ok(Json(cfg))
 }
 
@@ -717,6 +873,8 @@ pub struct DispatchBody {
     pub params: Option<Value>,
     #[serde(default)]
     pub run_id: Option<String>,
+    #[serde(default)]
+    pub confirm_prod: Option<targets::ConfirmProd>,
 }
 
 async fn dispatch_to_node(
@@ -765,6 +923,14 @@ async fn dispatch_command(
             "unknown spec",
         ));
     }
+    targets::ensure_prod_confirm(
+        &st.db,
+        &[id.clone()],
+        body.confirm_prod.as_ref(),
+        "dispatch",
+        &id,
+    )
+    .await?;
 
     let (run_id, delivered) =
         dispatch_to_node(&st, &id, &body.spec_id, body.params, body.run_id).await?;
@@ -1099,6 +1265,61 @@ impl From<tags::TagError> for ApiError {
     }
 }
 
+impl From<targets::TargetError> for ApiError {
+    fn from(err: targets::TargetError) -> Self {
+        use targets::TargetError::*;
+        match err {
+            Invalid(message) => ApiError::coded(StatusCode::BAD_REQUEST, "target_invalid", message),
+            Selector(err) => {
+                ApiError::coded(StatusCode::BAD_REQUEST, "selector_invalid", err.message)
+                    .with_extra(serde_json::json!({ "position": err.position }))
+            }
+            Unknown(ids) => ApiError::coded(StatusCode::NOT_FOUND, "node_unknown", "unknown node")
+                .with_extra(serde_json::json!({ "unknown_node_ids": ids })),
+            Changed { added, removed } => {
+                ApiError::coded(StatusCode::CONFLICT, "target_changed", "target changed")
+                    .with_extra(serde_json::json!({ "added": added, "removed": removed }))
+            }
+            Empty => ApiError::coded(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no_target_nodes",
+                "no target nodes",
+            ),
+            TooMany => ApiError::coded(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_many_targets",
+                "too many targets",
+            ),
+            Prod {
+                prod_node_ids,
+                prod_node_count,
+            } => ApiError::coded(
+                StatusCode::PRECONDITION_REQUIRED,
+                "prod_confirmation_required",
+                "prod confirmation required",
+            )
+            .with_extra(serde_json::json!({
+                "prod_node_ids": prod_node_ids,
+                "prod_node_count": prod_node_count,
+            })),
+            Timing(message) => {
+                ApiError::coded(StatusCode::BAD_REQUEST, "schedule_invalid", message)
+            }
+            ScheduleUnknown => ApiError::coded(
+                StatusCode::NOT_FOUND,
+                "schedule_unknown",
+                "unknown schedule",
+            ),
+            OperationUnknown => ApiError::coded(
+                StatusCode::NOT_FOUND,
+                "operation_unknown",
+                "unknown operation",
+            ),
+            Internal(err) => ApiError::from(err),
+        }
+    }
+}
+
 impl From<skill_desired::DesiredError> for ApiError {
     fn from(err: skill_desired::DesiredError) -> Self {
         use skill_desired::DesiredError::*;
@@ -1166,6 +1387,7 @@ impl From<skill_desired::DesiredError> for ApiError {
                 ApiError::coded(StatusCode::BAD_REQUEST, "invalid_bundle", message)
             }
             BadRequest(message) => ApiError::bad_request(message),
+            Target(err) => ApiError::from(err),
             Internal(err) => ApiError::from(err),
         }
     }

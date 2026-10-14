@@ -9,8 +9,8 @@ use crate::db::Db;
 use crate::hub::Hub;
 use crate::skill_catalog::is_builtin_name;
 use crate::skill_desired::{
-    accepted_hash, apply_installs, highest_published, published_versions, DesiredError,
-    InstallPlan, PerNode, Selection, SelectorBody, TargetView,
+    accepted_hash, apply_installs, highest_published, prepare_skill_aim, published_versions,
+    DesiredError, InstallPlan, PerNode, SelectorBody, TargetView,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -67,6 +67,10 @@ pub(crate) struct BundleInstallRequest {
     #[serde(default)]
     pub selector: Option<SelectorBody>,
     #[serde(default)]
+    pub target: Option<crate::targets::TargetBody>,
+    #[serde(default)]
+    pub confirm_prod: Option<crate::targets::ConfirmProd>,
+    #[serde(default)]
     pub accepted_capabilities: HashMap<String, String>,
     #[serde(default)]
     pub dry_run: bool,
@@ -76,6 +80,8 @@ pub(crate) struct BundleInstallRequest {
 pub(crate) struct BundleOperation {
     pub skill_name: String,
     pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_id: Option<String>,
     pub per_node: Vec<PerNode>,
 }
 
@@ -210,19 +216,34 @@ pub(crate) async fn install_bundle(
             platforms: best.platforms.clone(),
         });
     }
-    let selection = Selection::new(body.node_ids, body.selector);
-    let batch = apply_installs(db, hub, plans, selection, body.dry_run).await?;
-    let mut by_name: HashMap<String, (Option<String>, Vec<PerNode>)> = batch
+    let aim = prepare_skill_aim(
+        db,
+        hub,
+        body.target,
+        body.node_ids,
+        body.selector,
+        body.confirm_prod,
+        id,
+    )
+    .await?;
+    let batch = apply_installs(db, hub, plans, aim, body.dry_run).await?;
+    let mut by_name: HashMap<String, (Option<String>, Option<String>, Vec<PerNode>)> = batch
         .changes
         .into_iter()
-        .map(|change| (change.skill_name, (change.operation_id, change.per_node)))
+        .map(|change| {
+            (
+                change.skill_name,
+                (change.operation_id, change.resolution_id, change.per_node),
+            )
+        })
         .collect();
     let mut operations = Vec::with_capacity(bundle.items.len());
     for item in bundle.items {
-        if let Some((operation_id, per_node)) = by_name.remove(&item.skill_name) {
+        if let Some((operation_id, resolution_id, per_node)) = by_name.remove(&item.skill_name) {
             operations.push(BundleOperation {
                 skill_name: item.skill_name,
                 operation_id,
+                resolution_id,
                 per_node,
             });
             continue;
@@ -231,6 +252,7 @@ pub(crate) async fn install_bundle(
             operations.push(BundleOperation {
                 skill_name: item.skill_name,
                 operation_id: None,
+                resolution_id: None,
                 per_node: builtin_per_node(&batch.targets),
             });
         }
