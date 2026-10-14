@@ -8,6 +8,7 @@ pub mod retry;
 pub mod schedule;
 pub mod skill;
 pub mod spec;
+pub mod tags;
 
 pub use probe::{run_probe, ProbeError, ProbeOutcome, ProbePolicy, EXEC_DISABLED_REASON};
 pub use retry::{write_egress_result, PendingReport, RetrySpool};

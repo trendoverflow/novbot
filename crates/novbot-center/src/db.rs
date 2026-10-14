@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{mysql::MySqlPoolOptions, MySql, Pool, Row};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -31,7 +31,17 @@ pub struct NodeRow {
     pub node_id: String,
     pub hostname: String,
     pub version: String,
+    /// Boot-reported pairs from Register. Not the effective tag map.
     pub labels: Value,
+    /// Effective tags: center, else valid node, else system.
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    /// Source of each effective tag (`center`, `node`, or `system`).
+    #[serde(default)]
+    pub tag_sources: BTreeMap<String, String>,
+    /// Invalid node-declared pairs. They are not part of `tags`.
+    #[serde(default)]
+    pub invalid_tag_count: i64,
     pub last_seen_at: Option<DateTime<Utc>>,
 }
 
@@ -120,6 +130,10 @@ impl Db {
                 "005_skills_desired.sql",
                 include_str!("../migrations/005_skills_desired.sql"),
             ),
+            (
+                "006_node_tags.sql",
+                include_str!("../migrations/006_node_tags.sql"),
+            ),
         ] {
             for stmt in split_sql(sql) {
                 sqlx::query(stmt)
@@ -128,6 +142,9 @@ impl Db {
                     .with_context(|| format!("migrate {name}: {}", &stmt[..stmt.len().min(60)]))?;
             }
         }
+        crate::tags::backfill(self)
+            .await
+            .context("backfill node tags")?;
         Ok(())
     }
 
@@ -202,15 +219,54 @@ impl Db {
         )
         .fetch_all(&self.pool)
         .await?;
+        let tag_rows =
+            sqlx::query("SELECT node_id, tag_key, tag_value, source FROM node_tags_effective")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut grouped: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+        for row in tag_rows {
+            let node_id: String = row.try_get("node_id")?;
+            grouped.entry(node_id).or_default().push((
+                mysql_text(&row, "tag_key")?,
+                mysql_text(&row, "tag_value")?,
+                row.try_get("source")?,
+            ));
+        }
+        let invalid_rows = sqlx::query(
+            "SELECT node_id, COUNT(*) AS n FROM node_tags WHERE source = 'node' AND valid = 0 GROUP BY node_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut invalid_counts: HashMap<String, i64> = HashMap::new();
+        for row in invalid_rows {
+            invalid_counts.insert(row.try_get("node_id")?, row.try_get("n")?);
+        }
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let labels_raw: String = r.try_get("labels_json")?;
+            let node_id: String = r.try_get("node_id")?;
+            let mut bucket = grouped.remove(&node_id).unwrap_or_default();
+            bucket.sort_by_key(|(_, _, source)| match source.as_str() {
+                "system" => 0,
+                "node" => 1,
+                "center" => 2,
+                _ => 3,
+            });
+            let mut tags = BTreeMap::new();
+            let mut tag_sources = BTreeMap::new();
+            for (key, value, source) in bucket {
+                tags.insert(key.clone(), value);
+                tag_sources.insert(key, source);
+            }
             out.push(NodeRow {
-                node_id: r.try_get("node_id")?,
+                invalid_tag_count: invalid_counts.get(&node_id).copied().unwrap_or(0),
+                node_id,
                 hostname: r.try_get("hostname")?,
                 version: r.try_get("version")?,
                 labels: serde_json::from_str(&labels_raw)
                     .unwrap_or_else(|_| Value::Object(Default::default())),
+                tags,
+                tag_sources,
                 last_seen_at: r.try_get("last_seen_at")?,
             });
         }
@@ -502,6 +558,15 @@ fn mysql_u64(row: &sqlx::mysql::MySqlRow, column: &str) -> Result<u64> {
         return text.trim().parse().context("integer bytes");
     }
     anyhow::bail!("unsupported max_allowed_packet type")
+}
+
+/// `utf8mb4_bin` columns arrive as `VARBINARY`. Accept either that or a string.
+pub(crate) fn mysql_text(row: &sqlx::mysql::MySqlRow, column: &str) -> Result<String, sqlx::Error> {
+    if let Ok(value) = row.try_get::<String, _>(column) {
+        return Ok(value);
+    }
+    let bytes: Vec<u8> = row.try_get(column)?;
+    String::from_utf8(bytes).map_err(|err| sqlx::Error::Decode(Box::new(err)))
 }
 
 fn split_sql(sql: &str) -> Vec<&str> {

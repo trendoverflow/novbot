@@ -307,11 +307,17 @@ async fn handle(
                     );
                 }
             }
-            let labels: std::collections::HashMap<String, String> =
-                req.labels.into_iter().collect();
-            let (accepted, message) = match db
-                .upsert_node(&req.node_id, &req.hostname, &req.version, &labels)
-                .await
+            let tags: std::collections::HashMap<String, String> = req.tags.into_iter().collect();
+            let (accepted, message) = match crate::tags::register_node(
+                db,
+                &req.node_id,
+                &req.hostname,
+                &req.version,
+                &tags,
+                &req.os,
+                &req.arch,
+            )
+            .await
             {
                 Ok(()) => (true, "registered".to_string()),
                 Err(e) => (false, e.to_string()),
@@ -787,7 +793,7 @@ mod tests {
                 hostname: "test-host".into(),
                 version: "test".into(),
                 bootstrap_token: String::new(),
-                labels: HashMap::new(),
+                tags: HashMap::new(),
                 ..Default::default()
             })),
         }
