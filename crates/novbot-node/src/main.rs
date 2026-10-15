@@ -34,11 +34,32 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_SHA: &str = env!("NOVBOT_GIT_SHA");
 const RECONNECT_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(60);
 
+/// Package version, plus `+<git sha>` when the build embedded a commit.
+/// `nodes.version` is VARCHAR(64); `0.1.0` + a 40-char sha fits.
+fn register_version() -> String {
+    if GIT_SHA == "unknown" {
+        VERSION.to_string()
+    } else {
+        format!("{VERSION}+{GIT_SHA}")
+    }
+}
+
 #[derive(Debug, Parser)]
-#[command(name = "novbot-node", about = "NovBot node daemon")]
+#[command(
+    name = "novbot-node",
+    about = "NovBot node daemon",
+    version = env!("CARGO_PKG_VERSION"),
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("NOVBOT_GIT_SHA"),
+        ")"
+    )
+)]
 struct Args {
     /// Center gRPC endpoint (env: NOVBOT_CENTER_GRPC), for example http://127.0.0.1:50051.
     #[arg(long)]
@@ -136,6 +157,8 @@ async fn main() -> Result<()> {
         bootstrap_token_source = %bootstrap_token_source,
         config_file = %config_file,
         node_tags = %node_tags,
+        version = VERSION,
+        git_sha = GIT_SHA,
         "starting novbot-node"
     );
     warn_invalid_tags(&node_tags);
@@ -354,7 +377,7 @@ async fn run_session(
         body: Some(client_message::Body::Register(RegisterRequest {
             node_id: node_id.to_string(),
             hostname: hostname.to_string(),
-            version: VERSION.into(),
+            version: register_version(),
             bootstrap_token: cfg
                 .bootstrap_token
                 .as_ref()
@@ -939,6 +962,32 @@ async fn flush_spool(spool: &RetrySpool, out: &SessionOut) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod git_sha_tests {
+    use super::{register_version, GIT_SHA, VERSION};
+
+    #[test]
+    fn embedded_git_sha_is_present() {
+        assert!(!GIT_SHA.is_empty(), "git sha is empty");
+        let reported = register_version();
+        // nodes.version is VARCHAR(64). A full sha must still fit.
+        assert!(
+            reported.len() <= 64,
+            "register version does not fit nodes.version: {reported}"
+        );
+        if GIT_SHA == "unknown" {
+            assert_eq!(reported, VERSION);
+            return;
+        }
+        let hex = (12..=40).contains(&GIT_SHA.len())
+            && GIT_SHA
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        assert!(hex, "git sha {GIT_SHA} is not 12-40 lowercase hex");
+        assert_eq!(reported, format!("{VERSION}+{GIT_SHA}"));
+    }
 }
 
 #[cfg(test)]
