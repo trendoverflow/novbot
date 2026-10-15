@@ -24,7 +24,7 @@ use novbot_proto::{
     PullConfigRequest, PullSkillsRequest, RegisterRequest, ReportResultRequest, ServerMessage,
 };
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -113,6 +113,8 @@ struct RuntimeState {
     /// `config_generation`: generation 0 can be a real applied config.
     config_loaded: bool,
     last_run: HashMap<String, u64>,
+    /// Run ids already accepted on this process. A re-flush is not executed twice.
+    seen_dispatch_runs: HashSet<String>,
 }
 
 /// Live Session outbound. `None` while disconnected — ReportResult goes to the retry spool.
@@ -837,6 +839,44 @@ async fn run_dispatch(
     } else {
         d.run_id.clone()
     };
+    if !d.run_id.is_empty() {
+        let duplicate = {
+            let mut st = state.write().await;
+            !st.seen_dispatch_runs.insert(run_id.clone())
+        };
+        if duplicate {
+            // Center redelivers at-least-once. Ack the row so it leaves in_flight,
+            // but do not execute the skill again.
+            tracing::info!(%run_id, "duplicate dispatch ignored");
+            let observed_at = Utc::now().timestamp_millis();
+            let payload = json!({ "reason": "duplicate" });
+            let payload_json = serde_json::to_string(&payload)?;
+            let status = "ok".to_string();
+            let spec_id = d.spec_id.clone();
+            let pending = PendingReport {
+                node_id: node_id.to_string(),
+                run_id: run_id.clone(),
+                spec_id: spec_id.clone(),
+                status: status.clone(),
+                payload_json: payload_json.clone(),
+                observed_at_unix_ms: observed_at,
+                attempts: 1,
+            };
+            let msg = ClientMessage {
+                request_id: Uuid::new_v4().to_string(),
+                body: Some(client_message::Body::ReportResult(ReportResultRequest {
+                    node_id: node_id.to_string(),
+                    run_id,
+                    spec_id,
+                    status,
+                    payload_json,
+                    observed_at_unix_ms: observed_at,
+                })),
+            };
+            send_report_or_spool(out, spool, msg, pending).await?;
+            return Ok(());
+        }
+    }
     let prep = {
         let st = state.read().await;
         if !st.config_loaded {
@@ -1382,6 +1422,61 @@ mod dispatch_ready_tests {
         assert_eq!(items[0].status, "ok");
         assert_eq!(items[0].run_id, "run-ok");
         assert_eq!(items[0].spec_id, "host-skill");
+    }
+
+    #[tokio::test]
+    async fn duplicate_dispatch_reports_ok_without_rerun() {
+        let h = harness();
+        apply_config(
+            &h.state,
+            2,
+            &skill_specs("host-skill"),
+            "[]",
+            ProbePolicy::default(),
+        )
+        .await
+        .unwrap();
+        let skills = idle_skills(&h.data_dir).await;
+        let dispatch = Dispatch {
+            run_id: "run-dup".into(),
+            spec_id: "host-skill".into(),
+            params_json: String::new(),
+        };
+        run_dispatch(
+            "node-1",
+            &h.state,
+            &h.spool,
+            &h.data_dir,
+            &h.out,
+            &skills,
+            &dispatch,
+            ProbePolicy::default(),
+        )
+        .await
+        .unwrap();
+        h.spool.drain().await.unwrap();
+
+        run_dispatch(
+            "node-1",
+            &h.state,
+            &h.spool,
+            &h.data_dir,
+            &h.out,
+            &skills,
+            &dispatch,
+            ProbePolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        let items = h.spool.drain().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "ok");
+        assert_eq!(items[0].run_id, "run-dup");
+        assert_eq!(items[0].spec_id, "host-skill");
+        let payload: serde_json::Value = serde_json::from_str(&items[0].payload_json).unwrap();
+        assert_eq!(payload["reason"], "duplicate");
+        assert_eq!(h.state.read().await.seen_dispatch_runs.len(), 1);
     }
 
     #[tokio::test]
