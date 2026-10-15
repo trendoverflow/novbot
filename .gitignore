@@ -8,6 +8,7 @@ examples/**/*.sha256
 .env
 .env.*
 !.env.example
+!**/.env.example
 /data/
 /console/node_modules/
 /console/dist/

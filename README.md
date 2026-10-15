@@ -25,6 +25,10 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 See [`console/`](console/) for the web UI scaffold (`npm install` / `npm run dev` with Vite proxy to center).
 
+## Local demo pack
+
+See [`demo/README.md`](demo/README.md) for a runnable MySQL + center + node (+ console) demo (`demo/up.sh`, `demo/smoke.sh`). Uses `demo/.env.example` only — no committed secrets. Demo recommends `NOVBOT_API_TOKEN` set (Bearer on `/v1`).
+
 ## Prerequisites
 
 - Rust stable (1.85+)
