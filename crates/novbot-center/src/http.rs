@@ -823,9 +823,12 @@ async fn put_config(
     Path(id): Path<String>,
     Json(body): Json<PutConfigBody>,
 ) -> Result<Json<NodeConfig>, ApiError> {
-    // The nodes row must exist for the node_configs FK. Do not upsert:
-    // that overwrites hostname, version, labels, and last_seen_at.
-    st.db.ensure_node_placeholder(&id).await?;
+    // Nodes appear only via Register. Do not insert a placeholder row, and
+    // do not upsert: that would overwrite hostname, version, labels, and
+    // last_seen_at on an already registered node.
+    if !st.db.node_exists(&id).await? {
+        return Err(ApiError::not_found("node not found"));
+    }
     let specs_json = serde_json::to_string(&body.specs)?;
     let schedules_json = body
         .schedules
@@ -1443,7 +1446,11 @@ mod tests {
     }
 
     /// PUT /v1/nodes/:id/config through `router()`, the handler's real path.
-    async fn http_put_config(db: Db, id: &str, specs: &serde_json::Value) -> NodeConfig {
+    async fn http_put_config_response(
+        db: Db,
+        id: &str,
+        specs: &serde_json::Value,
+    ) -> (StatusCode, axum::body::Bytes) {
         let app = router(AppState {
             db,
             hub: Hub::new(),
@@ -1467,6 +1474,12 @@ mod tests {
         let bytes = to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("read body");
+        (status, bytes)
+    }
+
+    /// PUT that expects HTTP 200 and a `NodeConfig` body.
+    async fn http_put_config(db: Db, id: &str, specs: &serde_json::Value) -> NodeConfig {
+        let (status, bytes) = http_put_config_response(db, id, specs).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -1533,39 +1546,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_config_unknown_node_creates_placeholder_then_register_fills() {
+    async fn put_config_unknown_node_returns_404_and_creates_no_row() {
         let Some(db) = connect_test_db().await else {
             return;
         };
-        let id = format!("t16-{}", uuid::Uuid::new_v4());
+        let id = uuid::Uuid::new_v4().to_string();
         let specs = serde_json::json!([
             {"id": "disk", "kind": "probe", "params": {"mount": "/"}}
         ]);
-        let cfg = http_put_config(db.clone(), &id, &specs).await;
-        assert_eq!(cfg.config_generation, 1);
-        assert_eq!(cfg.node_id, id);
-        assert_eq!(parse_json(&cfg.specs_json), specs);
+        let (status, bytes) = http_put_config_response(db.clone(), &id, &specs).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "PUT /v1/nodes/{id}/config: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body = parse_json(&String::from_utf8_lossy(&bytes));
+        assert_eq!(body["error"], "node not found");
 
-        let placeholder = fetch_node(&db, &id).await;
-        assert_eq!(placeholder.hostname, "");
-        assert_eq!(placeholder.version, "");
-        assert_eq!(placeholder.labels, serde_json::json!({}));
-        assert_eq!(placeholder.last_seen_at, None);
-
-        let mut labels = HashMap::new();
-        labels.insert("role".to_string(), "db".to_string());
-        db.upsert_node(&id, "host-b", "0.1.0", &labels)
-            .await
-            .expect("register");
-
-        let registered = fetch_node(&db, &id).await;
-        assert_eq!(registered.hostname, "host-b");
-        assert_eq!(registered.version, "0.1.0");
-        assert_eq!(registered.labels, serde_json::json!({"role": "db"}));
-
-        let stored = db.get_config(&id).await.expect("get config").expect("row");
-        assert_eq!(stored.config_generation, 1);
-        assert_eq!(parse_json(&stored.specs_json), specs);
+        let nodes = db.list_nodes().await.expect("list nodes");
+        assert!(
+            nodes.iter().all(|n| n.node_id != id),
+            "PUT must not insert a nodes row for unknown id {id}"
+        );
     }
 
     #[tokio::test]

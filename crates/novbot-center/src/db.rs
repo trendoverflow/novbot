@@ -190,23 +190,16 @@ impl Db {
         Ok(())
     }
 
-    /// Insert an empty `nodes` row when `node_id` is unknown.
+    /// Whether Register (`upsert_node`) has already created this node.
     ///
-    /// `node_configs.node_id` references `nodes`. `INSERT IGNORE` creates that
-    /// parent row (hostname "", version "", labels `{}`, `last_seen_at` NULL)
-    /// and does not change hostname, version, labels, or `last_seen_at` when
-    /// the node has already registered.
-    pub async fn ensure_node_placeholder(&self, node_id: &str) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT IGNORE INTO nodes (node_id, hostname, version, labels_json, last_seen_at)
-            VALUES (?, '', '', '{}', NULL)
-            "#,
-        )
-        .bind(node_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    /// `PUT /v1/nodes/:id/config` returns 404 when this is false. It must not
+    /// insert a placeholder `nodes` row for an id that has never registered.
+    pub async fn node_exists(&self, node_id: &str) -> Result<bool> {
+        let row = sqlx::query("SELECT 1 FROM nodes WHERE node_id = ?")
+            .bind(node_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
     }
 
     pub async fn touch_node(&self, node_id: &str) -> Result<()> {
@@ -607,54 +600,11 @@ pub(crate) async fn connect_test_db() -> Option<Db> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn uploads_allowed_requires_packet_larger_than_16_mib() {
         assert!(!uploads_allowed(16 * 1024 * 1024));
         assert!(uploads_allowed(16 * 1024 * 1024 + 1));
         assert!(uploads_allowed(64 * 1024 * 1024));
-    }
-
-    async fn fetch_node(db: &Db, id: &str) -> NodeRow {
-        db.list_nodes()
-            .await
-            .expect("list nodes")
-            .into_iter()
-            .find(|n| n.node_id == id)
-            .unwrap_or_else(|| panic!("missing node {id}"))
-    }
-
-    #[tokio::test]
-    async fn ensure_node_placeholder_is_noop_for_existing_node() {
-        let Some(db) = connect_test_db().await else {
-            return;
-        };
-        let id = format!("t16-{}", uuid::Uuid::new_v4());
-        let mut labels = HashMap::new();
-        labels.insert("env".to_string(), "prod".to_string());
-        labels.insert("role".to_string(), "api".to_string());
-        db.upsert_node(&id, "host-c", "0.2.0", &labels)
-            .await
-            .expect("upsert");
-
-        let before = fetch_node(&db, &id).await;
-        assert_eq!(before.hostname, "host-c");
-        assert_eq!(before.version, "0.2.0");
-        assert_eq!(
-            before.labels,
-            serde_json::json!({"env": "prod", "role": "api"})
-        );
-        assert!(before.last_seen_at.is_some());
-
-        // A timestamp write would move last_seen_at; INSERT IGNORE must not.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        db.ensure_node_placeholder(&id).await.expect("placeholder");
-
-        let after = fetch_node(&db, &id).await;
-        assert_eq!(after.hostname, before.hostname);
-        assert_eq!(after.version, before.version);
-        assert_eq!(after.labels, before.labels);
-        assert_eq!(after.last_seen_at, before.last_seen_at);
     }
 }

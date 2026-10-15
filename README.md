@@ -66,7 +66,34 @@ cargo run -p novbot-center -- \
   --http-addr 0.0.0.0:8080
 ```
 
-### 4. Seed node config (HTTP)
+### 4. Run node
+
+Start the node before putting config. Register (`upsert_node` over gRPC) is the only way a `nodes` row is created. `PUT /v1/nodes/:id/config` for an id that has never registered returns **404** and does not insert a placeholder.
+
+```bash
+cargo run -p novbot-node -- \
+  --center-grpc http://127.0.0.1:50051 \
+  --node-id demo-1 \
+  --data-dir ./data/demo-1
+```
+
+Center address, node id, and bootstrap token resolve in this order: CLI flag, then environment variable, then a TOML file (`--config` or `NOVBOT_CONFIG`). The center address is required. When the node ID is not set by flag, env, or file, it falls back to `<data-dir>/node_id` (loaded, or generated and persisted).
+
+The `exec` Spec kind is disabled unless this node is started with `--allow-exec` or `NOVBOT_ALLOW_EXEC=true` (accepted true values: `1`, `true`, `yes`, `on`; false: `0`, `false`, `no`, `off`). `--allow-exec` wins over the environment variable. Any other value makes the process exit 2. Neither the center nor the TOML file can turn exec on.
+
+```toml
+center_grpc = "http://novbot-center:50051"
+node_id = "orb-arm-1"
+bootstrap_token = "replace-me"
+```
+
+The file may contain only those three keys. Any other key, including `allow_exec`, is rejected. The address must be `http(s)://host:port` with an explicit port. Environment variables: `NOVBOT_CENTER_GRPC`, `NOVBOT_NODE_ID`, `NOVBOT_BOOTSTRAP_TOKEN`, `NOVBOT_ALLOW_EXEC`.
+
+On success the node writes `./data/demo-1/last_result.json` (single-file OSS egress).
+
+### 5. Seed node config (HTTP)
+
+PUT requires a registered node (step 4). After the node has Registered, PUT the specs. The connected node pulls the update. An unknown id returns **404** and leaves `nodes` unchanged.
 
 ```bash
 curl -sS -X PUT http://127.0.0.1:8080/v1/nodes/demo-1/config \
@@ -91,29 +118,6 @@ curl -sS -X PUT http://127.0.0.1:8080/v1/nodes/demo-1/config \
     ]
   }'
 ```
-
-### 5. Run node
-
-```bash
-cargo run -p novbot-node -- \
-  --center-grpc http://127.0.0.1:50051 \
-  --node-id demo-1 \
-  --data-dir ./data/demo-1
-```
-
-Center address, node id, and bootstrap token resolve in this order: CLI flag, then environment variable, then a TOML file (`--config` or `NOVBOT_CONFIG`). The center address is required. When the node ID is not set by flag, env, or file, it falls back to `<data-dir>/node_id` (loaded, or generated and persisted).
-
-The `exec` Spec kind is disabled unless this node is started with `--allow-exec` or `NOVBOT_ALLOW_EXEC=true` (accepted true values: `1`, `true`, `yes`, `on`; false: `0`, `false`, `no`, `off`). `--allow-exec` wins over the environment variable. Any other value makes the process exit 2. Neither the center nor the TOML file can turn exec on.
-
-```toml
-center_grpc = "http://novbot-center:50051"
-node_id = "orb-arm-1"
-bootstrap_token = "replace-me"
-```
-
-The file may contain only those three keys. Any other key, including `allow_exec`, is rejected. The address must be `http(s)://host:port` with an explicit port. Environment variables: `NOVBOT_CENTER_GRPC`, `NOVBOT_NODE_ID`, `NOVBOT_BOOTSTRAP_TOKEN`, `NOVBOT_ALLOW_EXEC`.
-
-On success the node writes `./data/demo-1/last_result.json` (single-file OSS egress).
 
 ### 6. Dispatch a skill / MCP tool (M5)
 
@@ -171,7 +175,7 @@ Enable with `NOVBOT_LICENSE_KEY` or `PUT /v1/license` `{"key":"..."}` (stub acce
 |--------|------|-------------|
 | GET | `/health` | Liveness |
 | GET | `/v1/nodes` | List registered nodes |
-| GET/PUT | `/v1/nodes/:id/config` | Get/put specs (+ optional schedules) |
+| GET/PUT | `/v1/nodes/:id/config` | Get/put specs (+ optional schedules). PUT requires a registered node (404 if unknown; no placeholder row) |
 | GET/PUT | `/v1/nodes/:id/schedules` | Get/put schedules |
 | POST | `/v1/nodes/:id/dispatch` | DispatchCommand (skill / mcp_tool / probe) |
 | GET | `/v1/results?node_id=&limit=` | Recent probe results |
@@ -187,6 +191,10 @@ Optional HTTP auth: set `NOVBOT_API_TOKEN` so `/v1` requires `Authorization: Bea
 ## gRPC
 
 `Control.Session` bi-directional stream: Register, Heartbeat, PullConfig, ReportResult, Ack; server may PushConfig / Dispatch / PushSchedule.
+
+## Demo / network binding
+
+The default demo entry is loopback only: `http://127.0.0.1/` on the Mac, via the OrbStack center VM. The packaged nginx site ([`demo/nginx/novbot-console.conf`](demo/nginx/novbot-console.conf)) listens on `127.0.0.1:80`. Do not advertise a LAN bind (`listen 80;`, `0.0.0.0:80`, or `*:80`) as the default. LAN opt-in stays off unless Product marks it allowed. See [`demo/README.md`](demo/README.md).
 
 ## Repositories
 

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Seed OrbStack demo node config (center-authoritative). Safe to re-run.
+# Assumes the node has already Registered. OrbStack systemd nodes do this
+# on start. PUT /v1/nodes/:id/config returns 404 for an unknown id and does
+# not insert a nodes row.
 # Default: Mac tunnel http://127.0.0.1:18080 + node orb-arm-1 + demo Bearer.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
