@@ -29,6 +29,9 @@ use uuid::Uuid;
 /// body of 16 MiB + 1 byte reaches the handler and returns `package_too_large`.
 const UPLOAD_BODY_LIMIT: usize = crate::db::PACKAGE_MAX_BYTES as usize + 1024 * 1024;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_SHA: &str = env!("NOVBOT_GIT_SHA");
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
@@ -137,7 +140,12 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({"ok": true, "service": "novbot-center"}))
+    Json(serde_json::json!({
+        "ok": true,
+        "service": "novbot-center",
+        "version": VERSION,
+        "git_sha": GIT_SHA,
+    }))
 }
 
 #[derive(Serialize)]
@@ -1558,5 +1566,34 @@ mod tests {
         let stored = db.get_config(&id).await.expect("get config").expect("row");
         assert_eq!(stored.config_generation, 1);
         assert_eq!(parse_json(&stored.specs_json), specs);
+    }
+
+    #[tokio::test]
+    async fn health_includes_git_sha() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let response = super::health().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("health body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("health json");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["service"], "novbot-center");
+        assert_eq!(body["version"], super::VERSION);
+        let sha = body["git_sha"].as_str().expect("git_sha");
+        assert_eq!(sha, super::GIT_SHA);
+        assert_embedded_sha(sha);
+    }
+
+    fn assert_embedded_sha(sha: &str) {
+        assert!(!sha.is_empty(), "git sha is empty");
+        if sha == "unknown" {
+            return;
+        }
+        let hex = (12..=40).contains(&sha.len())
+            && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        assert!(hex, "git sha {sha} is not 12-40 lowercase hex");
     }
 }

@@ -32,7 +32,17 @@ use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "novbot-center", about = "NovBot API-only control center")]
+#[command(
+    name = "novbot-center",
+    about = "NovBot API-only control center",
+    version = env!("CARGO_PKG_VERSION"),
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("NOVBOT_GIT_SHA"),
+        ")"
+    )
+)]
 struct Args {
     /// MySQL URL, e.g. mysql://novbot:novbot@127.0.0.1:3306/novbot
     #[arg(long, env = "NOVBOT_DATABASE_URL")]
