@@ -9,6 +9,19 @@ use sqlx::{mysql::MySqlPoolOptions, MySql, Pool, Row};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Claimed queue rows older than this are eligible to send again.
+pub const PENDING_DISPATCH_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One claimed `pending_dispatches` row. `params_json` is canonical JSON text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedDispatch {
+    pub id: i64,
+    pub run_id: String,
+    pub spec_id: String,
+    pub params_json: String,
+}
 
 /// Largest accepted `.nbskill` body. `max_allowed_packet` must be strictly larger:
 /// the INSERT packet is the blob plus the SQL text.
@@ -138,7 +151,15 @@ impl Db {
                 "007_target_resolutions.sql",
                 include_str!("../migrations/007_target_resolutions.sql"),
             ),
+            (
+                "008_pending_dispatch_inflight.sql",
+                include_str!("../migrations/008_pending_dispatch_inflight.sql"),
+            ),
         ] {
+            if name == "008_pending_dispatch_inflight.sql" {
+                self.migrate_pending_inflight(sql).await?;
+                continue;
+            }
             for stmt in split_sql(sql) {
                 sqlx::query(stmt)
                     .execute(&self.pool)
@@ -435,39 +456,153 @@ impl Db {
         Ok(res.last_insert_id() as i64)
     }
 
-    pub async fn take_pending_dispatches(
+    /// Claim available or stale in-flight rows. Does not delete them.
+    pub async fn claim_pending_dispatches(
         &self,
         node_id: &str,
-    ) -> Result<Vec<(String, String, String)>> {
+        ack_timeout: Duration,
+    ) -> Result<Vec<ClaimedDispatch>> {
+        let cutoff = Utc::now()
+            - chrono::Duration::from_std(ack_timeout).unwrap_or_else(|_| chrono::Duration::seconds(60));
+        let mut tx = self.pool.begin().await?;
         let rows = sqlx::query(
             r#"
             SELECT id, run_id, spec_id, params_json
-            FROM pending_dispatches WHERE node_id = ? ORDER BY id ASC
+            FROM pending_dispatches
+            WHERE node_id = ?
+              AND (in_flight_at IS NULL OR in_flight_at < ?)
+            ORDER BY id ASC
+            FOR UPDATE
             "#,
         )
         .bind(node_id)
-        .fetch_all(&self.pool)
+        .bind(cutoff)
+        .fetch_all(&mut *tx)
         .await?;
 
         let mut out = Vec::with_capacity(rows.len());
-        let mut ids = Vec::new();
         for r in rows {
             let id: i64 = r.try_get("id")?;
-            ids.push(id);
+            sqlx::query(
+                r#"
+                UPDATE pending_dispatches
+                SET in_flight_at = CURRENT_TIMESTAMP(3),
+                    attempt_count = attempt_count + 1
+                WHERE id = ?
+                "#,
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
             let run_id: String = r.try_get("run_id")?;
             let spec_id: String = r.try_get("spec_id")?;
             let params_raw: String = r.try_get("params_json")?;
             let params: Value = serde_json::from_str(&params_raw)
                 .unwrap_or_else(|_| Value::Object(Default::default()));
-            out.push((run_id, spec_id, serde_json::to_string(&params)?));
+            out.push(ClaimedDispatch {
+                id,
+                run_id,
+                spec_id,
+                params_json: serde_json::to_string(&params)?,
+            });
         }
-        for id in ids {
-            sqlx::query("DELETE FROM pending_dispatches WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
-        }
+        tx.commit().await?;
         Ok(out)
+    }
+
+    /// Drop the queue row after the node reports a result for this run.
+    pub async fn ack_pending_dispatch(&self, node_id: &str, run_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM pending_dispatches WHERE node_id = ? AND run_id = ?")
+            .bind(node_id)
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Clear `in_flight_at` so the rows can be claimed again. Keeps `attempt_count`.
+    pub async fn requeue_pending_dispatches(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE pending_dispatches SET in_flight_at = NULL WHERE id IN ({placeholders})"
+        );
+        let mut q = sqlx::query(&sql);
+        for id in ids {
+            q = q.bind(id);
+        }
+        q.execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Session ended or a new Register replaced the stream. Make in-flight rows available.
+    pub async fn requeue_in_flight_for_node(&self, node_id: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE pending_dispatches
+            SET in_flight_at = NULL
+            WHERE node_id = ? AND in_flight_at IS NOT NULL
+            "#,
+        )
+        .bind(node_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn count_pending_dispatches(&self, node_id: &str) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_dispatches WHERE node_id = ?",
+        )
+        .bind(node_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// Rows that are not currently claimed (`in_flight_at` is NULL).
+    pub async fn count_pending_available(&self, node_id: &str) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pending_dispatches WHERE node_id = ? AND in_flight_at IS NULL",
+        )
+        .bind(node_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    async fn migrate_pending_inflight(&self, sql: &str) -> Result<()> {
+        let exists: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'pending_dispatches'
+              AND COLUMN_NAME = 'in_flight_at'
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if exists > 0 {
+            return Ok(());
+        }
+        for stmt in split_sql(sql) {
+            // Text protocol: MySQL error 1295 rejects DDL on prepared statements.
+            sqlx::raw_sql(stmt)
+                .execute(&self.pool)
+                .await
+                .with_context(|| {
+                    format!(
+                        "migrate 008_pending_dispatch_inflight.sql: {}",
+                        &stmt[..stmt.len().min(60)]
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     pub async fn get_license_key(&self) -> Result<String> {
@@ -606,5 +741,74 @@ mod tests {
         assert!(!uploads_allowed(16 * 1024 * 1024));
         assert!(uploads_allowed(16 * 1024 * 1024 + 1));
         assert!(uploads_allowed(64 * 1024 * 1024));
+    }
+
+    async fn attempt_count(db: &Db, id: i64) -> i32 {
+        sqlx::query_scalar("SELECT attempt_count FROM pending_dispatches WHERE id = ?")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .expect("attempt_count")
+    }
+
+    #[tokio::test]
+    async fn claim_ack_requeue_and_stale_reclaim() {
+        let Some(db) = connect_test_db().await else {
+            return;
+        };
+        let node = format!("claim-{}", uuid::Uuid::new_v4());
+        db.upsert_node(&node, "host", "test", &HashMap::new())
+            .await
+            .expect("upsert");
+        let id = db
+            .enqueue_dispatch(&node, "run-1", "spec", "{}")
+            .await
+            .expect("enqueue");
+        assert_eq!(db.count_pending_available(&node).await.unwrap(), 1);
+
+        let claimed = db
+            .claim_pending_dispatches(&node, PENDING_DISPATCH_ACK_TIMEOUT)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, id);
+        assert_eq!(claimed[0].run_id, "run-1");
+        assert_eq!(db.count_pending_dispatches(&node).await.unwrap(), 1);
+        assert_eq!(db.count_pending_available(&node).await.unwrap(), 0);
+        assert_eq!(attempt_count(&db, id).await, 1);
+        let again = db
+            .claim_pending_dispatches(&node, PENDING_DISPATCH_ACK_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(again.is_empty(), "fresh in-flight row is not reclaimed");
+
+        db.requeue_pending_dispatches(&[id]).await.expect("requeue");
+        assert_eq!(db.count_pending_available(&node).await.unwrap(), 1);
+        let claimed = db
+            .claim_pending_dispatches(&node, PENDING_DISPATCH_ACK_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(attempt_count(&db, id).await, 2);
+
+        sqlx::query(
+            "UPDATE pending_dispatches SET in_flight_at = DATE_SUB(NOW(3), INTERVAL 120 SECOND) WHERE id = ?",
+        )
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let reclaimed = db
+            .claim_pending_dispatches(&node, PENDING_DISPATCH_ACK_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(attempt_count(&db, id).await, 3);
+
+        db.requeue_in_flight_for_node(&node).await.unwrap();
+        assert_eq!(db.count_pending_available(&node).await.unwrap(), 1);
+        db.ack_pending_dispatch(&node, "run-1").await.unwrap();
+        assert_eq!(db.count_pending_dispatches(&node).await.unwrap(), 0);
+        db.ack_pending_dispatch(&node, "missing").await.unwrap();
     }
 }

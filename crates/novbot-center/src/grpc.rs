@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::artifact::ArtifactStore;
-use crate::db::Db;
+use crate::db::{Db, PENDING_DISPATCH_ACK_TIMEOUT};
 use crate::hub::Hub;
 use crate::skill_delivery;
 use anyhow::Result;
@@ -163,6 +163,13 @@ impl Control for ControlSvc {
                             if bound_node.as_deref() != Some(nid.as_str()) {
                                 if let Some(old) = bound_node.take() {
                                     hub.unregister(&old, &push_tx).await;
+                                    if let Err(e) = db.requeue_in_flight_for_node(&old).await {
+                                        tracing::warn!(
+                                            error = %e,
+                                            node_id = %old,
+                                            "requeue in-flight dispatches failed"
+                                        );
+                                    }
                                 }
                                 bound_node = Some(nid);
                                 gate = ReadyGate::new(ready_timeout);
@@ -232,6 +239,13 @@ impl Control for ControlSvc {
             }
             if let Some(nid) = bound_node {
                 hub.unregister(&nid, &push_tx).await;
+                if let Err(e) = db.requeue_in_flight_for_node(&nid).await {
+                    tracing::warn!(
+                        error = %e,
+                        node_id = %nid,
+                        "requeue in-flight dispatches failed"
+                    );
+                }
             }
         });
 
@@ -323,6 +337,15 @@ async fn handle(
                 Err(e) => (false, e.to_string()),
             };
             let bound = if accepted {
+                // Drop a half-open previous sender before this session is Ready.
+                hub.evict(&node_id).await;
+                if let Err(e) = db.requeue_in_flight_for_node(&node_id).await {
+                    tracing::warn!(
+                        error = %e,
+                        %node_id,
+                        "requeue in-flight dispatches on register failed"
+                    );
+                }
                 hub.note_abi(&node_id, &req.skill_abi);
                 Some(node_id.clone())
             } else {
@@ -438,7 +461,12 @@ async fn handle(
             )
             .await
             {
-                Ok(()) => true,
+                Ok(()) => {
+                    if let Err(e) = db.ack_pending_dispatch(&req.node_id, &req.run_id).await {
+                        tracing::warn!(error = %e, "ack_pending_dispatch failed");
+                    }
+                    true
+                }
                 Err(e) => {
                     tracing::warn!(error = ?e, "insert_result failed");
                     false
@@ -492,24 +520,31 @@ async fn flush_pending(
     node_id: &str,
     tx: &mpsc::Sender<Result<ServerMessage, Status>>,
 ) -> usize {
-    let pending = match db.take_pending_dispatches(node_id).await {
+    let pending = match db
+        .claim_pending_dispatches(node_id, PENDING_DISPATCH_ACK_TIMEOUT)
+        .await
+    {
         Ok(pending) => pending,
         Err(e) => {
-            tracing::warn!(error = %e, %node_id, "take_pending_dispatches failed");
+            tracing::warn!(error = %e, %node_id, "claim_pending_dispatches failed");
             return 0;
         }
     };
     let mut flushed = 0;
-    for (run_id, spec_id, params_json) in pending {
+    for (i, row) in pending.iter().enumerate() {
         let dispatch = ServerMessage {
             request_id: uuid::Uuid::new_v4().to_string(),
             body: Some(server_message::Body::Dispatch(Dispatch {
-                run_id,
-                spec_id,
-                params_json,
+                run_id: row.run_id.clone(),
+                spec_id: row.spec_id.clone(),
+                params_json: row.params_json.clone(),
             })),
         };
         if tx.send(Ok(dispatch)).await.is_err() {
+            let ids: Vec<i64> = pending[i..].iter().map(|row| row.id).collect();
+            if let Err(e) = db.requeue_pending_dispatches(&ids).await {
+                tracing::warn!(error = %e, %node_id, "requeue unsent dispatches failed");
+            }
             break;
         }
         flushed += 1;
@@ -707,11 +742,6 @@ mod tests {
         assert!(!after.on_timeout(now + timeout + Duration::from_secs(30)));
     }
 
-    fn migrate_lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
     struct Running {
         addr: SocketAddr,
         db: Db,
@@ -725,19 +755,10 @@ mod tests {
         inbound: tonic::Streaming<ServerMessage>,
     }
 
-    async fn running(test_name: &str, ready_timeout: Duration) -> Option<Running> {
-        let url = std::env::var("NOVBOT_TEST_DATABASE_URL").unwrap_or_default();
-        if url.trim().is_empty() {
-            eprintln!("skipping {test_name}: NOVBOT_TEST_DATABASE_URL is unset or empty");
+    async fn running(_test_name: &str, ready_timeout: Duration) -> Option<Running> {
+        let Some(db) = crate::db::connect_test_db().await else {
             return None;
-        }
-        let db = Db::connect(url.trim())
-            .await
-            .expect("connect NOVBOT_TEST_DATABASE_URL");
-        {
-            let _guard = migrate_lock().lock().await;
-            db.migrate().await.expect("migrate");
-        }
+        };
         let hub = Hub::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
@@ -837,6 +858,24 @@ mod tests {
             .await
             .expect("enqueue");
         cfg.config_generation
+    }
+
+    #[tokio::test]
+    async fn flush_requeues_unsent_when_channel_closes() {
+        let Some(db) = crate::db::connect_test_db().await else {
+            return;
+        };
+        let node = format!("flush-fail-{}", uuid::Uuid::new_v4());
+        db.upsert_node(&node, "host", "test", &HashMap::new())
+            .await
+            .expect("upsert");
+        db.enqueue_dispatch(&node, "a", "s", "{}").await.unwrap();
+        db.enqueue_dispatch(&node, "b", "s", "{}").await.unwrap();
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        assert_eq!(super::flush_pending(&db, &node, &tx).await, 0);
+        assert_eq!(db.count_pending_dispatches(&node).await.unwrap(), 2);
+        assert_eq!(db.count_pending_available(&node).await.unwrap(), 2);
     }
 
     async fn recv(inbound: &mut tonic::Streaming<ServerMessage>) -> ServerMessage {
@@ -958,12 +997,21 @@ mod tests {
         order.push("dispatch");
         assert_eq!(order, ["register", "pull", "dispatch"]);
 
-        let left = srv
-            .db
-            .take_pending_dispatches(&srv.node_id)
-            .await
-            .expect("take");
-        assert!(left.is_empty(), "pending row still present: {left:?}");
+        assert_eq!(
+            srv.db
+                .count_pending_available(&srv.node_id)
+                .await
+                .expect("available"),
+            0,
+            "flushed row should stay in flight until ReportResult"
+        );
+        assert_eq!(
+            srv.db
+                .count_pending_dispatches(&srv.node_id)
+                .await
+                .expect("count"),
+            1
+        );
 
         let live = srv
             .hub
@@ -1019,12 +1067,20 @@ mod tests {
         assert_eq!(dispatch.run_id, "R");
         assert_eq!(dispatch.spec_id, "host-skill");
 
-        let left = srv
-            .db
-            .take_pending_dispatches(&srv.node_id)
-            .await
-            .expect("take");
-        assert!(left.is_empty(), "pending row still present: {left:?}");
+        assert_eq!(
+            srv.db
+                .count_pending_available(&srv.node_id)
+                .await
+                .expect("available"),
+            0
+        );
+        assert_eq!(
+            srv.db
+                .count_pending_dispatches(&srv.node_id)
+                .await
+                .expect("count"),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1060,12 +1116,20 @@ mod tests {
             "dispatch flushed too late ({elapsed:?})"
         );
 
-        let left = srv
-            .db
-            .take_pending_dispatches(&srv.node_id)
-            .await
-            .expect("take");
-        assert!(left.is_empty(), "pending row still present: {left:?}");
+        assert_eq!(
+            srv.db
+                .count_pending_available(&srv.node_id)
+                .await
+                .expect("available"),
+            0
+        );
+        assert_eq!(
+            srv.db
+                .count_pending_dispatches(&srv.node_id)
+                .await
+                .expect("count"),
+            1
+        );
     }
 
     #[tokio::test]

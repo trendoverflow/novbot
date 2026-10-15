@@ -46,6 +46,11 @@ impl Hub {
         }
     }
 
+    /// Drop whatever sender is registered, including a half-open previous session.
+    pub async fn evict(&self, node_id: &str) {
+        self.write().remove(node_id);
+    }
+
     /// A live Session sender is registered for `node_id`.
     ///
     /// Desired-set handlers use this to choose `pending` or `queued`. They do not send.
@@ -148,6 +153,24 @@ mod tests {
         assert_eq!(hub.check_ticket(&ticket, "node-a", "def"), Err("mismatch"));
         let expired = hub.issue_ticket_ttl("node-a", "abc", Duration::ZERO);
         assert_eq!(hub.check_ticket(&expired, "node-a", "abc"), Err("expired"));
+    }
+
+    #[tokio::test]
+    async fn evict_drops_sender_until_register() {
+        let hub = Hub::new();
+        let (tx1, mut rx1) = mpsc::channel(1);
+        let (tx2, mut rx2) = mpsc::channel(1);
+        hub.register("node-a".into(), tx1).await;
+        hub.evict("node-a").await;
+        let msg = ServerMessage {
+            request_id: "x".into(),
+            body: None,
+        };
+        assert!(!hub.send("node-a", msg.clone()).await);
+        hub.register("node-a".into(), tx2).await;
+        assert!(hub.send("node-a", msg).await);
+        assert!(rx1.try_recv().is_err());
+        assert!(rx2.try_recv().is_ok());
     }
 
     #[test]

@@ -827,11 +827,18 @@ pub(crate) async fn dispatch_target(
             .await;
         let delivered = if live { "live" } else { "queued" };
         if live {
-            let _ = sqlx::query("DELETE FROM pending_dispatches WHERE node_id = ? AND run_id = ?")
-                .bind(&node_id)
-                .bind(&run_id)
-                .execute(db.pool())
-                .await;
+            let _ = sqlx::query(
+                r#"
+                UPDATE pending_dispatches
+                SET in_flight_at = CURRENT_TIMESTAMP(3),
+                    attempt_count = attempt_count + 1
+                WHERE node_id = ? AND run_id = ?
+                "#,
+            )
+            .bind(&node_id)
+            .bind(&run_id)
+            .execute(db.pool())
+            .await;
             let _ = sqlx::query(
                 "UPDATE dispatch_operation_runs SET delivered = 'live' WHERE operation_id = ? AND node_id = ?",
             )
