@@ -1,0 +1,45 @@
+# EC2 deploy stub. workflow_dispatch only.
+#
+# Future path, after Fei GO: build the pinned tip, upload the artifact to S3,
+# then SSM Run Command to install it and restart systemd
+# (novbot-center, novbot-node, nginx). No SSH.
+#
+# This stub does not build, does not upload, and does not call AWS.
+# It has no id-token permission. Do not add long-lived AWS keys.
+#
+# GitHub Environment "aws-staging" required reviewers are configured in the
+# repository settings, not in this file. Approval is not Fei's GO.
+
+name: Deploy EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_sha:
+        description: "Tip to deploy after Fei GO. This stub does not deploy."
+        required: false
+        default: "7b3f6913"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Refuse deploy until Fei GO
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: aws-staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Refuse deploy
+        env:
+          GIT_SHA: ${{ inputs.git_sha }}
+        run: |
+          echo "Requested tip: ${GIT_SHA}"
+          echo "Future path: artifact to S3, then SSM restart of systemd units."
+          echo "::error::EC2 deploy is a stub. No S3 upload, no SSM, no SSH. Nothing was deployed."
+          exit 1

@@ -1,0 +1,36 @@
+# APPLY IS FORBIDDEN until Fei gives an explicit GO.
+#
+# Trigger: workflow_dispatch only. There is no push or pull_request trigger.
+#
+# GitHub Environment "aws-staging" must be created in the repository settings
+# with required reviewers before this workflow is allowed to do more than
+# refuse. Required reviewers are not expressed in this file. Approval in
+# GitHub is not a substitute for Fei's GO.
+#
+# This stub checks out the repo and exits 1. It does not run terraform, it
+# does not assume a role, and it has no id-token permission. Do not add
+# AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY.
+
+name: Terraform apply
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    name: Refuse apply until Fei GO
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: aws-staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Refuse apply
+        run: |
+          echo "::error::terraform apply is forbidden until Fei gives an explicit GO. This workflow is a stub and did not call AWS."
+          exit 1

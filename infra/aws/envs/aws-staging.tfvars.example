@@ -1,0 +1,26 @@
+# aws-staging placeholders. Safe to keep in git.
+# Copy only after Fei GO, and do not commit the copy:
+#
+#   cp envs/aws-staging.tfvars.example envs/aws-staging.tfvars
+#
+# Banned in any tfvars file: real account ids, AWS access keys, Bearer tokens,
+# database passwords, and OrbStack demo tokens (including demo-api-token-change-me).
+
+aws_region       = "ap-east-1" # placeholder until Fei names the region
+environment      = "aws-staging"
+enable_resources = false
+tip_sha          = "7b3f6913"
+
+center_instance_type = "t4g.small" # x86 alternative: t3.small
+node_instance_type   = "t4g.small"
+node_count           = 0
+
+rds_instance_class = "db.t4g.micro"
+rds_multi_az       = false
+
+# Leave commented until Fei accepts a domain, an AMI, and a client CIDR.
+# ami_id                  = "ami-REPLACE_ME"
+# certificate_domain_name = "staging.example.invalid"
+# alb_ingress_cidrs       = []
+
+github_repository = "trendoverflow/novbot"
