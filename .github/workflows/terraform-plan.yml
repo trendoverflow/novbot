@@ -1,0 +1,71 @@
+# Format and validate infra/aws on pull requests.
+# This workflow does not assume an AWS role, does not run terraform plan,
+# and does not run terraform apply.
+#
+# Future, only after Fei GO, a bootstrapped S3 + DynamoDB backend, and
+# GitHub Environment "aws-staging" required reviewers. Uncommenting this is
+# a later change. Do not put a real account id in this file. Do not add
+# AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY.
+#
+# - uses: aws-actions/configure-aws-credentials@v4
+#   with:
+#     role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/novbot-gha-terraform-plan
+#     aws-region: <REGION>
+# - run: terraform init -input=false
+# - run: terraform plan -var-file=envs/aws-staging.tfvars -input=false -no-color
+
+name: Terraform plan
+
+on:
+  pull_request:
+    paths:
+      - "infra/aws/**"
+      - ".github/workflows/terraform-plan.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-plan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: fmt and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: infra/aws
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.3"
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform init
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate -no-color
+
+      - name: OIDC plan role placeholder
+        working-directory: .
+        run: |
+          echo "Role name: novbot-gha-terraform-plan"
+          echo "Auth: GitHub OIDC. No long-lived AWS keys."
+          echo "This step does not call AWS and does not assume a role."
+          echo "terraform plan is intentionally not run."
+          if [ -n "${AWS_ROLE_ARN}" ]; then
+            echo "AWS_ROLE_ARN is set in the job environment and was ignored."
+          fi
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
