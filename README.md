@@ -196,6 +196,10 @@ Optional HTTP auth: set `NOVBOT_API_TOKEN` so `/v1` requires `Authorization: Bea
 
 The default demo entry is loopback only: `http://127.0.0.1/` on the Mac, via the OrbStack center VM. The packaged nginx site ([`demo/nginx/novbot-console.conf`](demo/nginx/novbot-console.conf)) listens on `127.0.0.1:80`. Do not advertise a LAN bind (`listen 80;`, `0.0.0.0:80`, or `*:80`) as the default. LAN opt-in stays off unless Product marks it allowed. See [`demo/README.md`](demo/README.md).
 
+## AWS (skeleton, no apply)
+
+[`infra/aws/`](infra/aws/) is the EC2 + systemd Terraform skeleton for a future `aws-staging` environment. Every AWS resource stays off unless `enable_resources` is set (default `false`). GitHub Actions can format and validate that tree. They do not apply or deploy. Fei must approve before any AWS apply. Do not reuse OrbStack demo tokens there. Details: [`infra/aws/README.md`](infra/aws/README.md).
+
 ## Repositories
 
 - Public OSS: `trendoverflow/novbot`
